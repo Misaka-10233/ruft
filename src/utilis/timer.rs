@@ -5,30 +5,44 @@ use tokio::time::Duration;
 
 use log::warn;
 
+// 空信号类型：通道中只关心“发生了”，不需要携带数据。
+// Empty signal type: channels only need to say "it happened".
 pub struct Signal;
 
+// 随机超时计时器：Raft 用随机选举超时降低多个节点同时竞选的概率。
+// Randomized timeout timer: Raft uses it to reduce simultaneous candidacies.
 pub struct Timer {
+    // 超时事件接收端，调用方监听它来触发选举。
+    // Timeout receiver; callers listen on it to trigger elections.
     pub tick: tokio::sync::mpsc::Receiver<Signal>,
 
-    // reset channel
+    // 重置信号发送端，收到合法 Leader 消息或投票后会重置。
+    // Reset sender; reset after valid leader messages or granted votes.
     _reset_sender: tokio::sync::mpsc::Sender<Signal>,
 
+    // 后台任务句柄，Drop 时会中止计时任务。
+    // Background task handle; aborted when the timer is dropped.
     _join_handle: tokio::task::JoinHandle<()>,
 }
 
 impl Timer {
+    // 创建一个上下界内随机触发的计时器；若上下界传反则自动交换。
+    // Creates a randomized timer; swapped automatically if bounds are reversed.
     pub fn new(mut lower_bound_ms: u32, mut upper_bound_ms: u32) -> Self {
         if lower_bound_ms > upper_bound_ms {
             std::mem::swap(&mut lower_bound_ms, &mut upper_bound_ms);
         }
-        // tick channel
+        // 超时通知通道。
+        // Timeout notification channel.
         let (tick_sender, tick_receiver) = mpsc::channel::<Signal>(1);
         let mut interval = random_interval(lower_bound_ms, upper_bound_ms);
 
-        // reset channel
+        // 重置通知通道。
+        // Reset notification channel.
         let (reset_sender, mut reset_receiver) = mpsc::channel::<Signal>(1);
 
-        // 启动定时器
+        // 每次 tick 或 reset 后都重新生成随机间隔，保持选举超时分散。
+        // After each tick or reset, choose a new interval to keep elections staggered.
         let join_handle = tokio::spawn(async move {
             loop {
                 select! {
@@ -53,14 +67,16 @@ impl Timer {
         }
     }
 
-    // 重置定时器
+    // 重置定时器；通道满时只记录告警，避免阻塞状态机。
+    // Resets the timer; logs a warning on a full channel to avoid blocking the state machine.
     pub fn reset(&mut self) {
         if let Err(err) = self._reset_sender.try_send(Signal) {
             warn!("Error sending timer reset signal: {err}");
         }
     }
 
-    // 停止定时器
+    // 主动停止后台计时任务。
+    // Explicitly stops the background timer task.
     pub fn stop(self) {
         self._join_handle.abort();
     }
@@ -72,13 +88,14 @@ impl Drop for Timer {
     }
 }
 
-// 生成一个随机的Duration，时间间隔在lower_bound_ms到upper_bound_ms之间
+// 生成上下界内的随机 Duration。
+// Generates a random Duration within the given bounds.
 fn rand_duration(lower_bound_ms: u32, upper_bound_ms: u32) -> Duration {
     rand::random_range(lower_bound_ms..=upper_bound_ms) * Duration::from_millis(1)
 }
 
-// 生成一个随机的Interval，时间间隔在lower_bound_ms到upper_bound_ms之间
-// 每次tick时，会发送一个Signal到tick channel
+// 生成随机 Interval；Delay 策略避免任务暂停后补发大量 tick。
+// Builds a random Interval; Delay avoids bursty catch-up ticks after pauses.
 fn random_interval(lower_bound_ms: u32, upper_bound_ms: u32) -> tokio::time::Interval {
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now(),
