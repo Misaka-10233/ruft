@@ -3,7 +3,9 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 
-struct Signal {}
+use log::warn;
+
+pub struct Signal;
 
 pub struct Timer {
     pub tick: tokio::sync::mpsc::Receiver<Signal>,
@@ -31,7 +33,7 @@ impl Timer {
             loop {
                 select! {
                     _ = interval.tick() => {
-                        if tick_sender.send(Signal {}).await.is_err() {
+                        if tick_sender.send(Signal).await.is_err() {
                             break;
                         }
                     }
@@ -53,7 +55,9 @@ impl Timer {
 
     // 重置定时器
     pub fn reset(&mut self) {
-        self._reset_sender.try_send(Signal {});
+        if let Err(err) = self._reset_sender.try_send(Signal) {
+            warn!("Error sending timer reset signal: {err}");
+        }
     }
 
     // 停止定时器
