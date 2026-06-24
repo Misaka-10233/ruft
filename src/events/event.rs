@@ -1,5 +1,6 @@
 use crate::rpc::append_entries::{AppendEntriesArgs, AppendEntriesReply};
 use crate::rpc::request_vote::{RequestVoteArgs, RequestVoteReply};
+use crate::ruft::RuftSnapshot;
 use tokio::sync::oneshot;
 
 // 节点内部事件：把 RPC、计时器和本地命令统一串到单线程状态机中。
@@ -34,5 +35,8 @@ pub enum Event {
     AppendEntriesReply(AppendEntriesReply),
     // 客户端提交的新命令，只有 Leader 会追加到日志。
     // New client command; only the leader appends it to the log.
-    NewLogEntries(Vec<u8>),
+    NewLogEntries(Vec<u8>, oneshot::Sender<bool>),
+    // 读取当前节点状态快照，供外部监控和集成测试观测。
+    // Reads a state snapshot for external monitoring and integration tests.
+    Snapshot(oneshot::Sender<RuftSnapshot>),
 }

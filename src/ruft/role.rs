@@ -1,5 +1,5 @@
-#[derive(PartialEq, Debug)]
-pub(crate) enum Role {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
     // Leader 处理客户端写入并复制日志。
     // Leader handles client writes and replicates logs.
     Leader,

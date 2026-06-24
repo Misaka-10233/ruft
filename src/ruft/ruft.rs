@@ -3,24 +3,20 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 
 use crate::events::event::Event::{self, VoteResult};
 use crate::rpc::append_entries::{AppendEntriesArgs, AppendEntriesReply};
 use crate::rpc::client::{NodeId, RuftClient};
 use crate::rpc::request_vote::{RequestVoteArgs, RequestVoteReply};
-use crate::rpc::rpc::Rpc;
 use crate::ruft::role::Role::{self};
+use crate::ruft::server::RuftServer;
 use crate::utilis::types::LogEntry;
 use log::{error, warn};
 use tarpc::context;
-use tokio::sync::mpsc::error::SendError;
 
 use tokio::sync::mpsc;
 
 use crate::utilis::timer::Timer;
-
-type SenderResult = Result<(), SendError<Event>>;
 
 // 单个 Raft 节点：所有状态修改都经由事件循环串行执行，避免并发写状态。
 // A single Raft node: all state mutations flow through the event loop serially.
@@ -68,6 +64,25 @@ pub struct Ruft {
     // Apply channel: exposes committed log entries to the caller's state machine.
     apply_sender: mpsc::UnboundedSender<Vec<u8>>,
     pub apply: mpsc::UnboundedReceiver<Vec<u8>>, // 暴露给调用者的 Apply Receiver。Receiver exposed to callers.
+}
+
+// 可克隆的运行时句柄：节点进入 run 后，调用方仍可提交日志和读取状态快照。
+// Cloneable runtime handle: callers can submit logs and inspect snapshots after run starts.
+#[derive(Clone)]
+pub struct RuftHandle {
+    event_sender: mpsc::Sender<Event>,
+}
+
+// 节点状态快照：只读观测数据，不暴露可变 Raft 内部结构。
+// Node state snapshot: read-only observations without exposing mutable internals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuftSnapshot {
+    pub node_id: NodeId,
+    pub role: Role,
+    pub current_term: u64,
+    pub commit_index: u64,
+    pub last_applied: u64,
+    pub log_len: usize,
 }
 
 impl Ruft {
@@ -159,8 +174,45 @@ impl Ruft {
 
     // 暴露给调用者的写入入口，真正追加前会先进入事件循环。
     // Public write entry; the command enters the event loop before being appended.
-    pub async fn append_log(&mut self, command: Vec<u8>) -> SenderResult {
-        self.event_sender.send(Event::NewLogEntries(command)).await
+    pub async fn append_log(
+        &self,
+        command: Vec<u8>,
+    ) -> Result<bool, tokio::sync::oneshot::error::RecvError> {
+        self.handle().append_log(command).await
+    }
+
+    // 创建运行时句柄；可在节点被后台任务持有后继续从测试或上层代码驱动它。
+    // Creates a runtime handle usable after the node is moved into a background task.
+    pub fn handle(&self) -> RuftHandle {
+        RuftHandle {
+            event_sender: self.event_sender.clone(),
+        }
+    }
+
+    // 取走 apply 接收端，便于调用方把节点移动到 run 任务前保留应用输出。
+    // Takes the apply receiver so callers can keep it before moving the node into run.
+    pub fn take_apply(&mut self) -> mpsc::UnboundedReceiver<Vec<u8>> {
+        let (_sender, receiver) = mpsc::unbounded_channel();
+        std::mem::replace(&mut self.apply, receiver)
+    }
+
+    // 返回当前状态快照；该方法在事件循环内调用时是串行一致的。
+    // Returns a current state snapshot; called inside the event loop it is serially consistent.
+    pub fn snapshot(&self) -> RuftSnapshot {
+        RuftSnapshot {
+            node_id: self.node_id,
+            role: self.role,
+            current_term: self.current_term,
+            commit_index: self.commit_index,
+            last_applied: self.last_applied,
+            log_len: self.log.len(),
+        }
+    }
+
+    // 创建网络服务句柄；tarpc server 应持有该轻量句柄，而不是直接持有 Ruft 状态机。
+    // Creates the network service handle; tarpc servers should hold this light handle, not Ruft itself.
+    pub fn server(&self) -> RuftServer {
+        RuftServer::new(self.node_id, self.event_sender.clone())
     }
 
     // 事件分发中心：所有分支都只在这里改变节点状态。
@@ -186,23 +238,12 @@ impl Ruft {
                 }
             }
             Event::Apply => {
-                // 按日志顺序应用，保证状态机观察到的命令顺序和提交顺序一致。
-                // Apply in log order so the state machine observes committed order.
-                while self.commit_index > self.last_applied {
-                    self.last_applied += 1;
-                    match self
-                        .apply_sender
-                        .send(self.log[self.last_applied as usize].command.clone())
-                    {
-                        Ok(_) => {}
-                        Err(err) => {
-                            error!("Error sending Apply message: {err}");
-                        }
-                    }
-                }
+                self._apply_committed();
             }
             Event::ElectionTimeout => {
-                self._become_candidate();
+                if self.role != Role::Leader {
+                    self._become_candidate();
+                }
             }
 
             Event::VoteResult(success, new_term) => {
@@ -217,8 +258,16 @@ impl Ruft {
             Event::Heartbeat => {
                 self._on_heartbeat();
             }
-            Event::NewLogEntries(log) => {
-                self._on_append_log(log);
+            Event::NewLogEntries(log, reply) => {
+                let accepted = self._on_append_log(log);
+                if let Err(err) = reply.send(accepted) {
+                    error!("Error sending NewLogEntries reply: {err:?}");
+                }
+            }
+            Event::Snapshot(reply) => {
+                if let Err(err) = reply.send(self.snapshot()) {
+                    error!("Error sending Snapshot reply: {err:?}");
+                }
             }
             Event::AppendEntriesReply(reply) => {
                 self._on_append_entries_reply(reply).await;
@@ -342,6 +391,7 @@ impl Ruft {
         if args.leader_commit > self.commit_index {
             let last_new_index = (self.log.len() - 1) as u64;
             self.commit_index = min(args.leader_commit, last_new_index);
+            self._apply_committed();
         }
         reply.success = true;
         reply.match_index = (self.log.len() - 1) as u64;
@@ -392,11 +442,11 @@ impl Ruft {
 
     // 处理客户端新日志；Leader 先追加本地日志，再等待多数派复制后提交。
     // Handles a new client log; this implementation accepts it only on the leader.
-    fn _on_append_log(&mut self, log: Vec<u8>) {
+    fn _on_append_log(&mut self, log: Vec<u8>) -> bool {
         // 非 Leader 不能直接接收写入。
         // Non-leaders do not accept writes directly.
         if self.role != Role::Leader {
-            return;
+            return false;
         }
 
         // 新日志使用当前 Leader 任期。
@@ -409,6 +459,7 @@ impl Ruft {
         // 立刻广播，减少客户端命令等待下一次心跳的延迟。
         // Broadcast immediately so client commands need not wait for the next heartbeat.
         self._boardcast_append_entries();
+        true
     }
 
     // 选举超时后成为 Candidate：增加任期、投给自己，并向其他节点拉票。
@@ -491,6 +542,7 @@ impl Ruft {
             .iter_mut()
             .for_each(|x| *x.1 = self.log.len() as u64);
         self.match_index.iter_mut().for_each(|x| *x.1 = 0);
+        self._boardcast_append_entries();
     }
 
     // 接受新的任期，同时回到 Follower 并清空本任期投票。
@@ -533,6 +585,7 @@ impl Ruft {
             // Leader 只能提交当前任期内、已复制到多数派的日志。
             // Leaders may commit only current-term entries replicated on a majority.
             self._advance_commit_index();
+            self._apply_committed();
         } else {
             // 复制失败通常表示 prev_log 不匹配，回退 next_index 后下次重试。
             // Failure usually means prev_log mismatch; decrement next_index and retry later.
@@ -563,6 +616,23 @@ impl Ruft {
 
             if replicated_count >= majority {
                 self.commit_index = index;
+            }
+        }
+    }
+
+    // 按日志顺序应用已提交日志，保证状态机观察到的命令顺序和提交顺序一致。
+    // Applies committed entries in log order so the state machine observes commit order.
+    fn _apply_committed(&mut self) {
+        while self.commit_index > self.last_applied {
+            self.last_applied += 1;
+            match self
+                .apply_sender
+                .send(self.log[self.last_applied as usize].command.clone())
+            {
+                Ok(_) => {}
+                Err(err) => {
+                    error!("Error sending Apply message: {err}");
+                }
             }
         }
     }
@@ -610,59 +680,33 @@ impl Ruft {
     }
 }
 
-impl Rpc for Ruft {
-    // tarpc 入口只负责把请求转入内部事件循环，并等待一次性响应。
-    // tarpc entrypoint only forwards the request into the event loop and waits once.
-    async fn append_entries(
-        self,
-        _ctx: context::Context,
-        args: AppendEntriesArgs,
-    ) -> AppendEntriesReply {
-        let (tx, rx) = oneshot::channel();
-        if let Err(err) = self.event_sender.send(Event::AppendEntries(args, tx)).await {
-            error!("Error sending AppendEntries event: {err}");
-            return AppendEntriesReply {
-                node_id: self.node_id,
-                term: self.current_term,
-                success: false,
-                match_index: 0,
-            };
+impl RuftHandle {
+    // 向节点提交日志；返回 true 表示当前节点是 Leader 并接受该命令。
+    // Submits a log; true means this node is currently leader and accepted it.
+    pub async fn append_log(
+        &self,
+        command: Vec<u8>,
+    ) -> Result<bool, tokio::sync::oneshot::error::RecvError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .event_sender
+            .send(Event::NewLogEntries(command, tx))
+            .await
+            .is_err()
+        {
+            return Err(rx.await.unwrap_err());
         }
-        match rx.await {
-            Ok(reply) => reply,
-            Err(err) => {
-                error!("Error receiving AppendEntries reply: {err}");
-                AppendEntriesReply {
-                    node_id: self.node_id,
-                    term: self.current_term,
-                    success: false,
-                    match_index: 0,
-                }
-            }
-        }
+        rx.await
     }
 
-    // tarpc 投票入口，同样通过事件循环串行处理，避免和本地状态并发冲突。
-    // tarpc vote entrypoint also serializes through the event loop to avoid state races.
-    async fn request_vote(self, _ctx: context::Context, args: RequestVoteArgs) -> RequestVoteReply {
-        let (tx, rx) = oneshot::channel();
-        if let Err(err) = self.event_sender.send(Event::RequestVote(args, tx)).await {
-            error!("Error sending RequestVote event: {err}");
-            return RequestVoteReply {
-                term: self.current_term,
-                vote_granted: false,
-            };
+    // 获取节点状态快照。
+    // Gets a node state snapshot.
+    pub async fn snapshot(&self) -> Result<RuftSnapshot, tokio::sync::oneshot::error::RecvError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.event_sender.send(Event::Snapshot(tx)).await.is_err() {
+            return Err(rx.await.unwrap_err());
         }
-        match rx.await {
-            Ok(reply) => reply,
-            Err(err) => {
-                error!("Error receiving RequestVote reply: {err}");
-                RequestVoteReply {
-                    term: self.current_term,
-                    vote_granted: false,
-                }
-            }
-        }
+        rx.await
     }
 }
 

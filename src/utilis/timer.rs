@@ -97,9 +97,10 @@ fn rand_duration(lower_bound_ms: u32, upper_bound_ms: u32) -> Duration {
 // 生成随机 Interval；Delay 策略避免任务暂停后补发大量 tick。
 // Builds a random Interval; Delay avoids bursty catch-up ticks after pauses.
 fn random_interval(lower_bound_ms: u32, upper_bound_ms: u32) -> tokio::time::Interval {
+    let period = rand_duration(lower_bound_ms, upper_bound_ms);
     let mut interval = tokio::time::interval_at(
-        tokio::time::Instant::now(),
-        rand_duration(lower_bound_ms, upper_bound_ms),
+        tokio::time::Instant::now() + period,
+        period,
     );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval
