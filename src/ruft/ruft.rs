@@ -1,6 +1,7 @@
 use futures::StreamExt;
 use std::cmp::min;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use crate::rpc::client::{NodeId, RuftClient};
 use crate::rpc::request_vote::{RequestVoteArgs, RequestVoteReply};
 use crate::ruft::role::Role::{self};
 use crate::ruft::server::RuftServer;
+use crate::storage::{FileStorage, HardState, MemoryStorage, Storage, StorageResult};
 use crate::utilis::types::LogEntry;
 use log::{error, warn};
 use tarpc::context;
@@ -37,6 +39,7 @@ pub struct Ruft {
 
     // 持久化通用状态，真实实现中应在 RPC 响应前落盘。
     // Persistent Raft state; a real implementation must persist before replying to RPCs.
+    storage: Box<dyn Storage>,
     current_term: u64,
     voted_for: Option<u64>,
     log: Vec<LogEntry>, // log[0] 为空哨兵日志。log[0] is an empty sentinel entry.
@@ -86,36 +89,67 @@ pub struct RuftSnapshot {
 }
 
 impl Ruft {
-    // 初始化节点状态；日志从哨兵项开始，便于使用 1-based Raft 索引。
-    // Initializes node state; the sentinel log entry makes 1-based Raft indexes convenient.
+    // 根据持久化开关选择存储层并恢复节点状态。
+    // Selects a storage backend from the durability flag, then restores node state.
     pub fn new(
         node_id: NodeId,
         rpc_client: RuftClient,
         members: Vec<NodeId>,
+        persistent: bool,
         election_timeout_lower_bound_ms: u32,
         election_timeout_upper_bound_ms: u32,
-    ) -> Self {
+    ) -> StorageResult<Self> {
+        let storage: Box<dyn Storage> = if persistent {
+            Box::new(FileStorage::open(Self::default_storage_dir(node_id))?)
+        } else {
+            Box::new(MemoryStorage::new())
+        };
+
+        Self::new_with_storage(
+            node_id,
+            rpc_client,
+            members,
+            storage,
+            election_timeout_lower_bound_ms,
+            election_timeout_upper_bound_ms,
+        )
+    }
+
+    fn default_storage_dir(node_id: NodeId) -> PathBuf {
+        PathBuf::from("ruft-data").join(format!("node-{node_id}"))
+    }
+
+    // 从已选定的存储层恢复节点状态；日志从哨兵项开始，便于使用 1-based Raft 索引。
+    // Restores node state from a selected storage backend; the sentinel log entry keeps 1-based indexes convenient.
+    fn new_with_storage(
+        node_id: NodeId,
+        rpc_client: RuftClient,
+        members: Vec<NodeId>,
+        storage: Box<dyn Storage>,
+        election_timeout_lower_bound_ms: u32,
+        election_timeout_upper_bound_ms: u32,
+    ) -> StorageResult<Self> {
         let (event_sender, event_receiver) = mpsc::channel::<Event>(1024);
         let (apply_sender, apply) = mpsc::unbounded_channel::<Vec<u8>>();
+        let storage_state = storage.load()?;
+        let log_len = storage_state.log.len() as u64;
 
         let mut next_index = HashMap::new();
         let mut match_index = HashMap::new();
         for id in members.iter().copied().filter(|id| *id != node_id) {
-            next_index.insert(id, 1);
+            next_index.insert(id, log_len);
             match_index.insert(id, 0);
         }
 
-        Self {
+        Ok(Self {
             node_id,
             rpc_client: Arc::new(rpc_client),
             members: Arc::new(members),
             role: Role::Follower,
-            current_term: 0,
-            voted_for: None,
-            log: vec![LogEntry {
-                term: 0,
-                command: Vec::new(),
-            }],
+            storage,
+            current_term: storage_state.hard_state.current_term,
+            voted_for: storage_state.hard_state.voted_for,
+            log: storage_state.log,
             commit_index: 0,
             last_applied: 0,
             next_index,
@@ -128,7 +162,7 @@ impl Ruft {
             ),
             apply_sender,
             apply,
-        }
+        })
     }
 
     // 主事件循环：把计时器 tick 和内部事件统一调度到状态机处理。
@@ -336,6 +370,39 @@ impl Ruft {
         });
     }
 
+    // 持久化 hard state 并立即刷盘；成功后调用方才能更新内存状态。
+    // Persists hard state and flushes immediately; callers update memory only after success.
+    fn persist_hard_state(
+        &mut self,
+        current_term: u64,
+        voted_for: Option<NodeId>,
+    ) -> StorageResult<()> {
+        self.storage.save_hard_state(HardState {
+            current_term,
+            voted_for,
+        })?;
+        self.storage.sync()
+    }
+
+    // 追加持久化日志并刷盘；Leader 本地接收新命令时使用。
+    // Appends persistent log entries and flushes; used when a leader accepts local commands.
+    fn append_persistent_entries(&mut self, entries: &[LogEntry]) -> StorageResult<()> {
+        self.storage.append_entries(entries)?;
+        self.storage.sync()
+    }
+
+    // 原子替换持久化日志后缀并刷盘；Follower 处理 Leader 覆盖时使用。
+    // Atomically replaces a persistent log suffix and flushes; used for follower conflict repair.
+    fn replace_persistent_suffix(
+        &mut self,
+        first_index_to_remove: u64,
+        entries: &[LogEntry],
+    ) -> StorageResult<()> {
+        self.storage
+            .replace_suffix(first_index_to_remove, entries)?;
+        self.storage.sync()
+    }
+
     // 处理 Leader 的心跳或日志复制请求，实现任期检查、日志匹配和提交推进。
     // Handles leader heartbeats/replication: term checks, log matching, and commit advance.
     async fn _handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
@@ -351,7 +418,15 @@ impl Ruft {
         // 遇到更高任期时必须立刻更新并退回 Follower。
         // A higher term must be adopted immediately, stepping down to follower.
         if args.term > self.current_term {
-            self._refresh_term(args.term);
+            if let Err(err) = self._refresh_term(args.term) {
+                error!("Error persisting higher term from AppendEntries: {err}");
+                return AppendEntriesReply {
+                    node_id: self.node_id,
+                    term: self.current_term,
+                    success: false,
+                    match_index: 0,
+                };
+            }
         }
 
         let mut reply = AppendEntriesReply {
@@ -383,8 +458,26 @@ impl Ruft {
 
         // 匹配点之后以 Leader 为准，删除冲突条目并追加新条目。
         // After the matching point, follow the leader by truncating conflicts and appending.
-        self.log.truncate(args.prev_log_index as usize + 1);
-        self.log.extend(args.entries);
+        let first_new_index = args.prev_log_index + 1;
+        let mut replace_from = None;
+        for (offset, entry) in args.entries.iter().enumerate() {
+            let index = first_new_index + offset as u64;
+            if index >= self.log.len() as u64 || self.log[index as usize].term != entry.term {
+                replace_from = Some(index);
+                break;
+            }
+        }
+
+        if let Some(index) = replace_from {
+            let entries_start = (index - first_new_index) as usize;
+            let new_entries = args.entries[entries_start..].to_vec();
+            if let Err(err) = self.replace_persistent_suffix(index, &new_entries) {
+                error!("Error persisting AppendEntries log replacement: {err}");
+                return reply;
+            }
+            self.log.truncate(index as usize);
+            self.log.extend(new_entries);
+        }
 
         // Follower 的提交进度不能超过本地已有的最后一条日志。
         // Follower commit index must not pass the last local log entry.
@@ -409,7 +502,13 @@ impl Ruft {
         }
 
         if args.term > self.current_term {
-            self._refresh_term(args.term);
+            if let Err(err) = self._refresh_term(args.term) {
+                error!("Error persisting higher term from RequestVote: {err}");
+                return RequestVoteReply {
+                    term: self.current_term,
+                    vote_granted: false,
+                };
+            }
         }
 
         let mut reply = RequestVoteReply {
@@ -430,6 +529,13 @@ impl Ruft {
         let can_vote = self.voted_for.is_none() || self.voted_for == Some(args.candidate_id);
 
         if can_vote && log_is_up_to_date {
+            if let Err(err) = self.persist_hard_state(self.current_term, Some(args.candidate_id)) {
+                error!(
+                    "Error persisting vote for candidate {}: {err}",
+                    args.candidate_id
+                );
+                return reply;
+            }
             self.voted_for = Some(args.candidate_id);
             reply.vote_granted = true;
 
@@ -451,10 +557,15 @@ impl Ruft {
 
         // 新日志使用当前 Leader 任期。
         // New entries are stamped with the current leader term.
-        self.log.push(LogEntry {
+        let entry = LogEntry {
             term: self.current_term,
             command: log,
-        });
+        };
+        if let Err(err) = self.append_persistent_entries(std::slice::from_ref(&entry)) {
+            error!("Error persisting leader log entry: {err}");
+            return false;
+        }
+        self.log.push(entry);
 
         // 立刻广播，减少客户端命令等待下一次心跳的延迟。
         // Broadcast immediately so client commands need not wait for the next heartbeat.
@@ -468,10 +579,14 @@ impl Ruft {
         // 开始新一轮选举前重置超时，避免马上再次触发。
         // Reset timeout before starting the new election round.
         self.election_timer.reset();
-        self.role = Role::Candidate;
-        self.current_term += 1;
+        let cur_term = self.current_term + 1;
+        if let Err(err) = self.persist_hard_state(cur_term, Some(self.node_id)) {
+            error!("Error persisting candidate hard state: {err}");
+            return;
+        }
 
-        let cur_term = self.current_term;
+        self.role = Role::Candidate;
+        self.current_term = cur_term;
 
         let majority = self.members.len() / 2 + 1;
 
@@ -520,7 +635,10 @@ impl Ruft {
     // Steps down to follower; a higher term also clears the recorded vote.
     fn _become_follower(&mut self, term: u64) {
         if term > self.current_term {
-            self._refresh_term(term);
+            if let Err(err) = self._refresh_term(term) {
+                error!("Error persisting follower term transition: {err}");
+                return;
+            }
         }
 
         self.role = Role::Follower;
@@ -547,10 +665,12 @@ impl Ruft {
 
     // 接受新的任期，同时回到 Follower 并清空本任期投票。
     // Adopts a new term, returns to follower, and clears the vote for that term.
-    fn _refresh_term(&mut self, new_term: u64) {
+    fn _refresh_term(&mut self, new_term: u64) -> StorageResult<()> {
+        self.persist_hard_state(new_term, None)?;
         self.current_term = new_term;
         self.role = Role::Follower;
         self.voted_for = None;
+        Ok(())
     }
 
     // 心跳节拍到达时，Leader 发送空或非空 AppendEntries。
@@ -569,7 +689,9 @@ impl Ruft {
             return;
         }
         if reply.term > self.current_term {
-            self._refresh_term(reply.term);
+            if let Err(err) = self._refresh_term(reply.term) {
+                error!("Error persisting higher term from AppendEntriesReply: {err}");
+            }
             return;
         }
         if self.role != Role::Leader || reply.term != self.current_term {
@@ -716,21 +838,108 @@ impl RuftHandle {
 mod tests {
     use super::*;
     use crate::rpc::client::RuftClient;
+    use crate::storage::{FileStorage, MemoryStorage, StorageState};
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> std::io::Result<Self> {
+            let mut path = std::env::temp_dir();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let seq = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            path.push(format!(
+                "ruft-node-storage-{}-{nanos}-{seq}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn new_test_node(node_id: NodeId, members: Vec<NodeId>) -> Ruft {
         Ruft::new(
             node_id,
             RuftClient::new(node_id, HashMap::new()),
             members,
+            false,
             150,
             300,
         )
+        .expect("load memory-backed node")
+    }
+
+    fn entry(term: u64, command: &[u8]) -> LogEntry {
+        LogEntry {
+            term,
+            command: command.to_vec(),
+        }
+    }
+
+    fn test_node_with_storage(
+        node_id: NodeId,
+        members: Vec<NodeId>,
+        storage: MemoryStorage,
+    ) -> Ruft {
+        Ruft::new_with_storage(
+            node_id,
+            RuftClient::new(node_id, HashMap::new()),
+            members,
+            Box::new(storage),
+            150,
+            300,
+        )
+        .expect("load test storage")
+    }
+
+    fn test_node_with_file_storage(
+        node_id: NodeId,
+        members: Vec<NodeId>,
+        storage: FileStorage,
+    ) -> Ruft {
+        Ruft::new_with_storage(
+            node_id,
+            RuftClient::new(node_id, HashMap::new()),
+            members,
+            Box::new(storage),
+            150,
+            300,
+        )
+        .expect("load file storage")
     }
 
     #[tokio::test]
     async fn new_initializes_follower_with_sentinel_log() {
-        let node = new_test_node(1, vec![1, 2, 3]);
+        let node = Ruft::new(
+            1,
+            RuftClient::new(1, HashMap::new()),
+            vec![1, 2, 3],
+            false,
+            150,
+            300,
+        )
+        .expect("load memory-backed node");
 
         assert_eq!(node.node_id, 1);
         assert_eq!(node.role, Role::Follower);
@@ -747,6 +956,226 @@ mod tests {
         assert_eq!(node.match_index[&3], 0);
         assert!(!node.next_index.contains_key(&1));
         assert!(!node.match_index.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn new_restores_persistent_state_from_storage() {
+        let storage = MemoryStorage::with_state(StorageState {
+            hard_state: HardState {
+                current_term: 4,
+                voted_for: Some(3),
+            },
+            log: vec![entry(0, b""), entry(2, b"old"), entry(4, b"new")],
+        })
+        .expect("valid storage state");
+
+        let node = test_node_with_storage(1, vec![1, 2, 3], storage);
+
+        assert_eq!(node.current_term, 4);
+        assert_eq!(node.voted_for, Some(3));
+        assert_eq!(node.log.len(), 3);
+        assert_eq!(node.next_index[&2], 3);
+        assert_eq!(node.next_index[&3], 3);
+    }
+
+    #[tokio::test]
+    async fn new_with_persistent_flag_restores_from_default_storage_dir() {
+        let node_id = 10_001;
+        let storage_dir = Ruft::default_storage_dir(node_id);
+        let _ = fs::remove_dir_all(&storage_dir);
+
+        {
+            let mut storage = FileStorage::open(&storage_dir).expect("open default file storage");
+            storage
+                .save_hard_state(HardState {
+                    current_term: 6,
+                    voted_for: Some(2),
+                })
+                .expect("save hard state");
+            storage
+                .append_entries(&[entry(3, b"default")])
+                .expect("append entries");
+            storage.sync().expect("sync");
+        }
+
+        let node = Ruft::new(
+            node_id,
+            RuftClient::new(node_id, HashMap::new()),
+            vec![node_id, 2],
+            true,
+            150,
+            300,
+        )
+        .expect("load persistent node from default dir");
+
+        assert_eq!(node.current_term, 6);
+        assert_eq!(node.voted_for, Some(2));
+        assert_eq!(node.log, vec![entry(0, b""), entry(3, b"default")]);
+        assert_eq!(node.next_index[&2], 2);
+
+        let _ = fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn new_restores_persistent_state_from_file_storage() {
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut storage = FileStorage::open(dir.path()).expect("open file storage");
+            storage
+                .save_hard_state(HardState {
+                    current_term: 4,
+                    voted_for: Some(3),
+                })
+                .expect("save hard state");
+            storage
+                .append_entries(&[entry(2, b"old"), entry(4, b"new")])
+                .expect("append entries");
+            storage.sync().expect("sync");
+        }
+
+        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        let node = test_node_with_file_storage(1, vec![1, 2, 3], storage);
+
+        assert_eq!(node.current_term, 4);
+        assert_eq!(node.voted_for, Some(3));
+        assert_eq!(node.log.len(), 3);
+        assert_eq!(node.next_index[&2], 3);
+        assert_eq!(node.next_index[&3], 3);
+    }
+
+    #[tokio::test]
+    async fn leader_append_log_persists_entry_before_accepting() {
+        let storage = MemoryStorage::with_state(StorageState {
+            hard_state: HardState {
+                current_term: 1,
+                voted_for: None,
+            },
+            log: vec![entry(0, b"")],
+        })
+        .expect("valid storage state");
+        let mut node = test_node_with_storage(1, vec![1, 2, 3], storage);
+        node.role = Role::Leader;
+
+        assert!(node._on_append_log(b"entry".to_vec()));
+
+        let persisted = node.storage.load().expect("load storage");
+        assert_eq!(persisted.log, vec![entry(0, b""), entry(1, b"entry")]);
+        assert_eq!(node.log, persisted.log);
+    }
+
+    #[tokio::test]
+    async fn leader_append_log_persists_entry_to_file_storage() {
+        let dir = TempDir::new().expect("temp dir");
+        let storage = FileStorage::open(dir.path()).expect("open file storage");
+        let mut node = test_node_with_file_storage(1, vec![1, 2, 3], storage);
+        node.current_term = 1;
+        node.role = Role::Leader;
+
+        assert!(node._on_append_log(b"entry".to_vec()));
+        drop(node);
+
+        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        assert_eq!(
+            storage.load().expect("load storage").log,
+            vec![entry(0, b""), entry(1, b"entry")]
+        );
+    }
+
+    #[tokio::test]
+    async fn append_entries_conflict_replacement_persists_storage_and_memory() {
+        let storage = MemoryStorage::with_state(StorageState {
+            hard_state: HardState {
+                current_term: 1,
+                voted_for: None,
+            },
+            log: vec![entry(0, b""), entry(1, b"keep"), entry(1, b"stale")],
+        })
+        .expect("valid storage state");
+        let mut node = test_node_with_storage(1, vec![1, 2, 3], storage);
+
+        let reply = node
+            ._handle_append_entries(AppendEntriesArgs {
+                term: 2,
+                leader_id: 2,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![entry(2, b"replace")],
+                leader_commit: 0,
+            })
+            .await;
+
+        assert!(reply.success);
+        let expected = vec![entry(0, b""), entry(1, b"keep"), entry(2, b"replace")];
+        assert_eq!(node.log, expected);
+        assert_eq!(node.storage.load().expect("load storage").log, expected);
+    }
+
+    #[tokio::test]
+    async fn append_entries_conflict_replacement_persists_to_file_storage() {
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut storage = FileStorage::open(dir.path()).expect("open file storage");
+            storage
+                .save_hard_state(HardState {
+                    current_term: 1,
+                    voted_for: None,
+                })
+                .expect("save hard state");
+            storage
+                .append_entries(&[entry(1, b"keep"), entry(1, b"stale")])
+                .expect("append entries");
+            storage.sync().expect("sync");
+        }
+
+        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        let mut node = test_node_with_file_storage(1, vec![1, 2, 3], storage);
+        let reply = node
+            ._handle_append_entries(AppendEntriesArgs {
+                term: 2,
+                leader_id: 2,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![entry(2, b"replace")],
+                leader_commit: 0,
+            })
+            .await;
+
+        assert!(reply.success);
+        drop(node);
+
+        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        assert_eq!(
+            storage.load().expect("load storage").log,
+            vec![entry(0, b""), entry(1, b"keep"), entry(2, b"replace")]
+        );
+    }
+
+    #[tokio::test]
+    async fn request_vote_persists_granted_vote() {
+        let mut node = new_test_node(1, vec![1, 2, 3]);
+
+        let reply = node._handle_request_vote(RequestVoteArgs {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        });
+
+        assert!(reply.vote_granted);
+        let persisted = node.storage.load().expect("load storage");
+        assert_eq!(persisted.hard_state.current_term, 1);
+        assert_eq!(persisted.hard_state.voted_for, Some(2));
+    }
+
+    #[tokio::test]
+    async fn candidate_self_vote_is_persisted() {
+        let mut node = new_test_node(1, vec![1]);
+
+        node._become_candidate();
+
+        let persisted = node.storage.load().expect("load storage");
+        assert_eq!(persisted.hard_state.current_term, 1);
+        assert_eq!(persisted.hard_state.voted_for, Some(1));
     }
 
     #[tokio::test]

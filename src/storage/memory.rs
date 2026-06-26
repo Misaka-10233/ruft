@@ -79,6 +79,30 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
+    // 先校验边界，再一次性替换后缀；内存实现不会发生中途 IO 失败。
+    // Validates bounds before replacing the suffix; memory cannot fail midway on IO.
+    fn replace_suffix(
+        &mut self,
+        first_index_to_remove: u64,
+        entries: &[LogEntry],
+    ) -> StorageResult<()> {
+        let len = self.state.log.len() as u64;
+        if first_index_to_remove == 0 {
+            return Err(StorageError::InvalidOperation(
+                "cannot replace the sentinel log entry".to_string(),
+            ));
+        }
+        if first_index_to_remove > len {
+            return Err(StorageError::InvalidOperation(format!(
+                "replace index {first_index_to_remove} is past log length {len}"
+            )));
+        }
+
+        self.state.log.truncate(first_index_to_remove as usize);
+        self.state.log.extend_from_slice(entries);
+        Ok(())
+    }
+
     // 内存存储没有刷盘动作，保留接口以匹配持久化后端语义。
     // Memory storage has nothing to flush; this preserves durable-backend semantics.
     fn sync(&mut self) -> StorageResult<()> {
@@ -194,6 +218,60 @@ mod tests {
         let err = storage
             .truncate_suffix(2)
             .expect_err("truncate should fail");
+
+        assert!(matches!(err, StorageError::InvalidOperation(_)));
+    }
+
+    #[test]
+    fn replace_suffix_replaces_existing_tail() {
+        let mut storage = MemoryStorage::new();
+        storage
+            .append_entries(&[entry(1, b"one"), entry(1, b"old")])
+            .expect("append entries");
+
+        storage
+            .replace_suffix(2, &[entry(2, b"new")])
+            .expect("replace suffix");
+
+        assert_eq!(
+            storage.load().expect("load").log,
+            vec![sentinel_log_entry(), entry(1, b"one"), entry(2, b"new")]
+        );
+    }
+
+    #[test]
+    fn replace_suffix_at_log_len_appends() {
+        let mut storage = MemoryStorage::new();
+        storage.append_entries(&[entry(1, b"one")]).expect("append");
+
+        storage
+            .replace_suffix(2, &[entry(2, b"two")])
+            .expect("replace at len");
+
+        assert_eq!(
+            storage.load().expect("load").log,
+            vec![sentinel_log_entry(), entry(1, b"one"), entry(2, b"two")]
+        );
+    }
+
+    #[test]
+    fn replace_suffix_zero_is_invalid() {
+        let mut storage = MemoryStorage::new();
+
+        let err = storage
+            .replace_suffix(0, &[entry(1, b"one")])
+            .expect_err("replace should fail");
+
+        assert!(matches!(err, StorageError::InvalidOperation(_)));
+    }
+
+    #[test]
+    fn replace_suffix_past_log_len_is_invalid() {
+        let mut storage = MemoryStorage::new();
+
+        let err = storage
+            .replace_suffix(2, &[entry(1, b"one")])
+            .expect_err("replace should fail");
 
         assert!(matches!(err, StorageError::InvalidOperation(_)));
     }

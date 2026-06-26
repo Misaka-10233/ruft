@@ -593,6 +593,7 @@ dependencies = [
 name = "ruft"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "futures",
  "log",
  "rand 0.10.1",

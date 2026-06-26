@@ -1,3 +1,4 @@
+mod file;
 mod memory;
 
 use std::error::Error;
@@ -5,19 +6,22 @@ use std::fmt::{Display, Formatter};
 
 use crate::rpc::client::NodeId;
 use crate::utilis::types::LogEntry;
+use serde::{Deserialize, Serialize};
 
+pub use file::FileStorage;
 pub use memory::MemoryStorage;
 
 // 存储层统一结果类型，便于后续文件 WAL 和快照实现复用。
 // Shared storage result type, reusable by future file WAL and snapshot backends.
 pub type StorageResult<T> = Result<T, StorageError>;
 
-// 存储层错误：先覆盖 IO 错误和违反存储语义的非法操作。
-// Storage errors: currently covers IO failures and invalid storage operations.
+// 存储层错误：区分底层 IO、调用方非法操作和已落盘数据损坏。
+// Storage errors: separates underlying IO, invalid caller operations, and persisted corruption.
 #[derive(Debug)]
 pub enum StorageError {
     Io(std::io::Error),       // 底层读写失败。Underlying read/write failure.
     InvalidOperation(String), // 调用方违反日志边界等约束。Caller violated log bounds/invariants.
+    Corruption(String),       // 持久化数据损坏。Persistent data is corrupt.
 }
 
 impl Display for StorageError {
@@ -27,6 +31,7 @@ impl Display for StorageError {
             StorageError::InvalidOperation(message) => {
                 write!(f, "invalid storage operation: {message}")
             }
+            StorageError::Corruption(message) => write!(f, "storage corruption: {message}"),
         }
     }
 }
@@ -36,6 +41,7 @@ impl Error for StorageError {
         match self {
             StorageError::Io(err) => Some(err),
             StorageError::InvalidOperation(_) => None,
+            StorageError::Corruption(_) => None,
         }
     }
 }
@@ -48,7 +54,7 @@ impl From<std::io::Error> for StorageError {
 
 // Raft 必须持久化的任期和投票状态。
 // Raft hard state that must survive process restarts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardState {
     pub current_term: u64,         // 当前任期。Current term.
     pub voted_for: Option<NodeId>, // 当前任期投给的节点。Node voted for in the current term.
@@ -89,6 +95,14 @@ pub trait Storage: Send + Sync {
     // 删除从指定索引开始的后缀日志，用于处理 Leader 覆盖冲突日志。
     // Removes the log suffix starting at the given index for leader conflict resolution.
     fn truncate_suffix(&mut self, first_index_to_remove: u64) -> StorageResult<()>;
+
+    // 原子替换从指定索引开始的日志后缀，避免 truncate/append 分步失败造成半更新。
+    // Atomically replaces the suffix from the given index, avoiding partial truncate/append updates.
+    fn replace_suffix(
+        &mut self,
+        first_index_to_remove: u64,
+        entries: &[LogEntry],
+    ) -> StorageResult<()>;
 
     // 刷盘边界；内存实现为空操作，文件实现应在这里 fsync。
     // Flush boundary; memory is a no-op, file backends should fsync here.

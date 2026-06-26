@@ -3,6 +3,7 @@
 mod events;
 mod rpc;
 mod ruft;
+mod storage;
 mod utilis;
 
 fn main() {
