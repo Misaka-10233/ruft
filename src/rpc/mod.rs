@@ -2,5 +2,6 @@
 // RPC module: contains Raft RPC data types, tarpc service definition, and client wrapper.
 pub mod append_entries;
 pub mod client;
+pub mod install_snapshot;
 pub mod request_vote;
 pub mod rpc;

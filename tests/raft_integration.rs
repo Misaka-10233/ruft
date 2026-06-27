@@ -1,7 +1,7 @@
 use futures::{StreamExt, future};
 use ruft::rpc::client::{NodeId, RuftClient};
 use ruft::rpc::rpc::{Rpc, RpcClient};
-use ruft::ruft::{Role, Ruft, RuftHandle};
+use ruft::ruft::{ApplyMsg, Role, Ruft, RuftHandle};
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
@@ -17,7 +17,7 @@ use tokio::time::{Duration, Instant, sleep, timeout};
 struct TestNode {
     id: NodeId,
     handle: RuftHandle,
-    apply: mpsc::UnboundedReceiver<Vec<u8>>,
+    apply: mpsc::UnboundedReceiver<ApplyMsg>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -101,7 +101,7 @@ async fn wait_for_leader_among(nodes: &[TestNode], active_ids: &[NodeId]) -> Nod
     loop {
         let mut leaders = Vec::new();
         for node in nodes.iter().filter(|node| active_ids.contains(&node.id)) {
-            let snapshot = node.handle.snapshot().await.expect("node snapshot");
+            let snapshot = node.handle.get_info().await.expect("node snapshot");
             if snapshot.role == Role::Leader {
                 leaders.push(snapshot.node_id);
             }
@@ -133,8 +133,10 @@ async fn wait_for_commit_among(nodes: &[TestNode], active_ids: &[NodeId], index:
         let mut committed = 0;
         let mut snapshots = Vec::new();
         for node in nodes.iter().filter(|node| active_ids.contains(&node.id)) {
-            let snapshot = node.handle.snapshot().await.expect("node snapshot");
-            if snapshot.commit_index >= index && snapshot.log_len > index as usize {
+            let snapshot = node.handle.get_info().await.expect("node snapshot");
+            if snapshot.commit_index >= index
+                && snapshot.snapshot_index + snapshot.log_len as u64 > index
+            {
                 committed += 1;
             }
             snapshots.push(snapshot);
@@ -177,10 +179,14 @@ fn abort_node(node: &mut TestNode) {
 }
 
 async fn recv_applied(node: &mut TestNode) -> Vec<u8> {
-    timeout(Duration::from_secs(3), node.apply.recv())
+    match timeout(Duration::from_secs(3), node.apply.recv())
         .await
         .expect("apply timeout")
         .expect("apply channel open")
+    {
+        ApplyMsg::Command { data, .. } => data,
+        ApplyMsg::Snapshot { .. } => panic!("expected command apply message"),
+    }
 }
 
 fn default_storage_dir(node_id: NodeId) -> PathBuf {
@@ -243,7 +249,7 @@ async fn follower_rejects_client_append() {
 
     sleep(Duration::from_millis(200)).await;
     for node in &nodes {
-        let snapshot = node.handle.snapshot().await.expect("node snapshot");
+        let snapshot = node.handle.get_info().await.expect("node snapshot");
         assert_eq!(snapshot.commit_index, 0, "node {} commit index", node.id);
         assert_eq!(snapshot.log_len, 1, "node {} log length", node.id);
     }
@@ -342,7 +348,7 @@ async fn persistent_node_restores_state_after_restart() {
     );
     wait_for_commit(&nodes, 1).await;
 
-    let leader_snapshot = leader.handle.snapshot().await.expect("leader snapshot");
+    let leader_snapshot = leader.handle.get_info().await.expect("leader snapshot");
     abort_all(&mut nodes);
     sleep(Duration::from_millis(100)).await;
 
@@ -355,7 +361,7 @@ async fn persistent_node_restores_state_after_restart() {
         180,
     )
     .expect("restore persistent node");
-    let restored_snapshot = restored.snapshot();
+    let restored_snapshot = restored.get_info();
 
     assert_eq!(restored_snapshot.current_term, leader_snapshot.current_term);
     assert_eq!(restored_snapshot.log_len, 2);

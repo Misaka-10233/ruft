@@ -1,4 +1,4 @@
-use crate::utilis::types::LogEntry;
+use crate::ruft::LogEntry;
 use serde::{Deserialize, Serialize};
 
 // AppendEntries RPC 参数：Leader 用它复制日志，也用空 entries 发送心跳。

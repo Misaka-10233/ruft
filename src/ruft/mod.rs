@@ -5,4 +5,4 @@ mod ruft;
 pub mod server;
 
 pub use role::Role;
-pub use ruft::{Ruft, RuftHandle, RuftSnapshot};
+pub use ruft::{ApplyMsg, LogEntry, Ruft, RuftHandle, RuftInfo, Snapshot, SnapshotMetadata};

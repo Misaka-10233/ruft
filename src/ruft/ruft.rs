@@ -8,17 +8,16 @@ use std::time::Duration;
 use crate::events::event::Event::{self, VoteResult};
 use crate::rpc::append_entries::{AppendEntriesArgs, AppendEntriesReply};
 use crate::rpc::client::{NodeId, RuftClient};
+use crate::rpc::install_snapshot::{InstallSnapshotArgs, InstallSnapshotReply};
 use crate::rpc::request_vote::{RequestVoteArgs, RequestVoteReply};
 use crate::ruft::role::Role::{self};
 use crate::ruft::server::RuftServer;
 use crate::storage::{FileStorage, HardState, MemoryStorage, Storage, StorageResult};
-use crate::utilis::types::LogEntry;
-use log::{error, warn};
-use tarpc::context;
-
-use tokio::sync::mpsc;
-
 use crate::utilis::timer::Timer;
+use log::{error, warn};
+use serde::{Deserialize, Serialize};
+use tarpc::context;
+use tokio::sync::mpsc;
 
 // 单个 Raft 节点：所有状态修改都经由事件循环串行执行，避免并发写状态。
 // A single Raft node: all state mutations flow through the event loop serially.
@@ -43,6 +42,9 @@ pub struct Ruft {
     current_term: u64,
     voted_for: Option<u64>,
     log: Vec<LogEntry>, // log[0] 为空哨兵日志。log[0] is an empty sentinel entry.
+    snapshot_index: u64,
+    snapshot_term: u64,
+    snapshot_data: Option<Vec<u8>>,
 
     // 临时通用状态：已提交索引和已应用索引。
     // Volatile shared state: committed index and applied index.
@@ -65,12 +67,28 @@ pub struct Ruft {
 
     // Apply 管道：把已提交日志交给调用方状态机。
     // Apply channel: exposes committed log entries to the caller's state machine.
-    apply_sender: mpsc::UnboundedSender<Vec<u8>>,
-    pub apply: mpsc::UnboundedReceiver<Vec<u8>>, // 暴露给调用者的 Apply Receiver。Receiver exposed to callers.
+    apply_sender: mpsc::UnboundedSender<ApplyMsg>,
+    pub apply: mpsc::UnboundedReceiver<ApplyMsg>, // 暴露给调用者的 Apply Receiver。Receiver exposed to callers.
 }
 
-// 可克隆的运行时句柄：节点进入 run 后，调用方仍可提交日志和读取状态快照。
-// Cloneable runtime handle: callers can submit logs and inspect snapshots after run starts.
+// Raft 日志条目：记录产生该命令的任期和要应用到状态机的命令字节。
+// Raft log entry: stores the term and command bytes applied to the state machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub term: u64,        // 写入该日志的任期。Term when this entry was written.
+    pub command: Vec<u8>, // 状态机命令。State-machine command.
+}
+
+// 应用层消息：区分普通日志命令和快照安装。
+// Apply message: separates normal log commands from snapshot installation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApplyMsg {
+    Command { index: u64, data: Vec<u8> },
+    Snapshot { index: u64, term: u64, data: Vec<u8> },
+}
+
+// 可克隆的运行时句柄：节点进入 run 后，调用方仍可提交日志和读取信息。
+// Cloneable runtime handle: callers can submit logs and inspect info after run starts.
 #[derive(Clone)]
 pub struct RuftHandle {
     event_sender: mpsc::Sender<Event>,
@@ -79,13 +97,26 @@ pub struct RuftHandle {
 // 节点状态快照：只读观测数据，不暴露可变 Raft 内部结构。
 // Node state snapshot: read-only observations without exposing mutable internals.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuftSnapshot {
+pub struct RuftInfo {
     pub node_id: NodeId,
     pub role: Role,
     pub current_term: u64,
     pub commit_index: u64,
     pub last_applied: u64,
     pub log_len: usize,
+    pub snapshot_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotMetadata {
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub metadata: SnapshotMetadata,
+    pub data: Vec<u8>,
 }
 
 impl Ruft {
@@ -100,7 +131,7 @@ impl Ruft {
         election_timeout_upper_bound_ms: u32,
     ) -> StorageResult<Self> {
         let storage: Box<dyn Storage> = if persistent {
-            Box::new(FileStorage::open(Self::default_storage_dir(node_id))?)
+            Box::new(FileStorage::open(Self::default_storage_dir(), node_id)?)
         } else {
             Box::new(MemoryStorage::new())
         };
@@ -115,8 +146,8 @@ impl Ruft {
         )
     }
 
-    fn default_storage_dir(node_id: NodeId) -> PathBuf {
-        PathBuf::from("ruft-data").join(format!("node-{node_id}"))
+    fn default_storage_dir() -> PathBuf {
+        PathBuf::from("ruft-data")
     }
 
     // 从已选定的存储层恢复节点状态；日志从哨兵项开始，便于使用 1-based Raft 索引。
@@ -130,14 +161,28 @@ impl Ruft {
         election_timeout_upper_bound_ms: u32,
     ) -> StorageResult<Self> {
         let (event_sender, event_receiver) = mpsc::channel::<Event>(1024);
-        let (apply_sender, apply) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (apply_sender, apply) = mpsc::unbounded_channel::<ApplyMsg>();
         let storage_state = storage.load()?;
-        let log_len = storage_state.log.len() as u64;
+        let snapshot_index = storage_state
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.metadata.last_included_index)
+            .unwrap_or(0);
+        let snapshot_term = storage_state
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.metadata.last_included_term)
+            .unwrap_or(0);
+        let snapshot_data = storage_state
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.data.clone());
+        let last_log_index = snapshot_index + storage_state.log.len() as u64 - 1;
 
         let mut next_index = HashMap::new();
         let mut match_index = HashMap::new();
         for id in members.iter().copied().filter(|id| *id != node_id) {
-            next_index.insert(id, log_len);
+            next_index.insert(id, last_log_index + 1);
             match_index.insert(id, 0);
         }
 
@@ -150,8 +195,11 @@ impl Ruft {
             current_term: storage_state.hard_state.current_term,
             voted_for: storage_state.hard_state.voted_for,
             log: storage_state.log,
-            commit_index: 0,
-            last_applied: 0,
+            snapshot_index,
+            snapshot_term,
+            snapshot_data,
+            commit_index: snapshot_index,
+            last_applied: snapshot_index,
             next_index,
             match_index,
             event_sender,
@@ -225,21 +273,22 @@ impl Ruft {
 
     // 取走 apply 接收端，便于调用方把节点移动到 run 任务前保留应用输出。
     // Takes the apply receiver so callers can keep it before moving the node into run.
-    pub fn take_apply(&mut self) -> mpsc::UnboundedReceiver<Vec<u8>> {
+    pub fn take_apply(&mut self) -> mpsc::UnboundedReceiver<ApplyMsg> {
         let (_sender, receiver) = mpsc::unbounded_channel();
         std::mem::replace(&mut self.apply, receiver)
     }
 
-    // 返回当前状态快照；该方法在事件循环内调用时是串行一致的。
-    // Returns a current state snapshot; called inside the event loop it is serially consistent.
-    pub fn snapshot(&self) -> RuftSnapshot {
-        RuftSnapshot {
+    // 返回当前节点信息；该方法在事件循环内调用时是串行一致的。
+    // Returns a current state info; called inside the event loop it is serially consistent.
+    pub fn get_info(&self) -> RuftInfo {
+        RuftInfo {
             node_id: self.node_id,
             role: self.role,
             current_term: self.current_term,
             commit_index: self.commit_index,
             last_applied: self.last_applied,
             log_len: self.log.len(),
+            snapshot_index: self.snapshot_index,
         }
     }
 
@@ -271,8 +320,11 @@ impl Ruft {
                     }
                 }
             }
-            Event::Apply => {
-                self._apply_committed();
+            Event::InstallSnapshot(_args, _reply) => {
+                let reply = self._handle_install_snapshot(_args).await;
+                if let Err(err) = _reply.send(reply) {
+                    error!("Error sending InstallSnapshot reply: {err:?}");
+                }
             }
             Event::ElectionTimeout => {
                 if self.role != Role::Leader {
@@ -298,13 +350,22 @@ impl Ruft {
                     error!("Error sending NewLogEntries reply: {err:?}");
                 }
             }
-            Event::Snapshot(reply) => {
-                if let Err(err) = reply.send(self.snapshot()) {
+            Event::CreateSnapshot(index, data, reply) => {
+                let accepted = self._on_create_snapshot(index, data);
+                if let Err(err) = reply.send(accepted) {
+                    error!("Error sending CreateSnapshot reply: {err:?}");
+                }
+            }
+            Event::GetInfo(reply) => {
+                if let Err(err) = reply.send(self.get_info()) {
                     error!("Error sending Snapshot reply: {err:?}");
                 }
             }
             Event::AppendEntriesReply(reply) => {
                 self._on_append_entries_reply(reply).await;
+            }
+            Event::InstallSnapshotReply(reply) => {
+                self._on_install_snapshot_reply(reply);
             }
         }
     }
@@ -316,7 +377,27 @@ impl Ruft {
             return;
         }
         let ctx = tarpc::context::Context::current();
-        let args = self._generate_append_entries_args(id);
+        if self.next_index[&id] <= self.snapshot_index {
+            let Some(args) = self._generate_install_snapshot_args() else {
+                return;
+            };
+            match self.rpc_client.call_install_snapshot(id, ctx, args).await {
+                Ok(reply) => {
+                    if let Err(err) = self
+                        .event_sender
+                        .send(Event::InstallSnapshotReply(reply))
+                        .await
+                    {
+                        error!("Error sending InstallSnapshotReply event: {err}");
+                    }
+                }
+                Err(err) => error!("Error calling InstallSnapshot on node {id}: {err}"),
+            }
+            return;
+        }
+        let Some(args) = self._generate_append_entries_args(id) else {
+            return;
+        };
 
         match self.rpc_client.call_append_entries(id, ctx, args).await {
             Ok(reply) => {
@@ -347,16 +428,34 @@ impl Ruft {
 
         // 先在当前线程构建参数，避免后台任务直接读取可变 Raft 状态。
         // Build args before spawning so the task does not read mutable Raft state.
-        let mut args_list: Vec<(u64, AppendEntriesArgs)> = Vec::new();
+        let mut append_args_list: Vec<(u64, AppendEntriesArgs)> = Vec::new();
+        let mut snapshot_args_list: Vec<(u64, InstallSnapshotArgs)> = Vec::new();
         for id in members.iter() {
             if *id == me {
                 continue;
             }
-            args_list.push((*id, self._generate_append_entries_args(*id)));
+            if self.next_index[id] <= self.snapshot_index {
+                if let Some(args) = self._generate_install_snapshot_args() {
+                    snapshot_args_list.push((*id, args));
+                }
+            } else if let Some(args) = self._generate_append_entries_args(*id) {
+                append_args_list.push((*id, args));
+            }
         }
 
         tokio::spawn(async move {
-            for (id, args) in args_list.into_iter() {
+            for (id, args) in snapshot_args_list.into_iter() {
+                match client.call_install_snapshot(id, ctx, args).await {
+                    Ok(reply) => {
+                        if let Err(err) = sender.send(Event::InstallSnapshotReply(reply)).await {
+                            error!("Error sending InstallSnapshotReply event: {err}");
+                            break;
+                        }
+                    }
+                    Err(err) => error!("Error calling InstallSnapshot on node {id}: {err}"),
+                }
+            }
+            for (id, args) in append_args_list.into_iter() {
                 match client.call_append_entries(id, ctx, args).await {
                     Ok(reply) => {
                         if let Err(err) = sender.send(Event::AppendEntriesReply(reply)).await {
@@ -398,9 +497,64 @@ impl Ruft {
         first_index_to_remove: u64,
         entries: &[LogEntry],
     ) -> StorageResult<()> {
+        let local_index = first_index_to_remove - self.snapshot_index;
         self.storage
-            .replace_suffix(first_index_to_remove, entries)?;
+            .replace_suffix(local_index, entries)?;
         self.storage.sync()
+    }
+
+    fn save_persistent_snapshot(&mut self, snapshot: Snapshot) -> StorageResult<()> {
+        let last_included_index = snapshot.metadata.last_included_index;
+        let last_included_term = snapshot.metadata.last_included_term;
+        self.storage.save_snapshot(snapshot)?;
+        self.storage
+            .compact_log(last_included_index, last_included_term)?;
+        self.storage.sync()
+    }
+
+    fn last_log_index(&self) -> u64 {
+        self.snapshot_index + self.log.len() as u64 - 1
+    }
+
+    fn last_log_term(&self) -> u64 {
+        self.log.last().map(|entry| entry.term).unwrap_or(self.snapshot_term)
+    }
+
+    fn offset(&self, index: u64) -> Option<usize> {
+        if index < self.snapshot_index || index > self.last_log_index() {
+            None
+        } else {
+            Some((index - self.snapshot_index) as usize)
+        }
+    }
+
+    fn term_at(&self, index: u64) -> Option<u64> {
+        self.offset(index).map(|offset| self.log[offset].term)
+    }
+
+    fn entry_at(&self, index: u64) -> Option<&LogEntry> {
+        self.offset(index).and_then(|offset| self.log.get(offset))
+    }
+
+    fn entries_from(&self, index: u64) -> Vec<LogEntry> {
+        match self.offset(index) {
+            Some(offset) => self.log[offset..].to_vec(),
+            None => Vec::new(),
+        }
+    }
+
+    fn compact_in_memory(&mut self, last_included_index: u64, last_included_term: u64) {
+        let local_index = (last_included_index - self.snapshot_index) as usize;
+        let mut compacted = vec![LogEntry {
+            term: last_included_term,
+            command: Vec::new(),
+        }];
+        if local_index + 1 < self.log.len() {
+            compacted.extend_from_slice(&self.log[local_index + 1..]);
+        }
+        self.log = compacted;
+        self.snapshot_index = last_included_index;
+        self.snapshot_term = last_included_term;
     }
 
     // 处理 Leader 的心跳或日志复制请求，实现任期检查、日志匹配和提交推进。
@@ -448,11 +602,13 @@ impl Ruft {
 
         // Raft 日志一致性检查：前一条日志必须同时匹配索引和任期。
         // Raft log consistency check: previous entry must match by index and term.
-        let log_len = self.log.len() as u64;
-        if args.prev_log_index >= log_len {
+        if args.prev_log_index < self.snapshot_index {
+            return reply; // Leader 仍在发送已经被本节点压缩掉的前缀。
+        }
+        if args.prev_log_index > self.last_log_index() {
             return reply; // 索引超出日志范围。Index is beyond local log.
         }
-        if args.prev_log_term != self.log[args.prev_log_index as usize].term {
+        if self.term_at(args.prev_log_index) != Some(args.prev_log_term) {
             return reply; // 日志任期不匹配。Previous log term does not match.
         }
 
@@ -462,7 +618,7 @@ impl Ruft {
         let mut replace_from = None;
         for (offset, entry) in args.entries.iter().enumerate() {
             let index = first_new_index + offset as u64;
-            if index >= self.log.len() as u64 || self.log[index as usize].term != entry.term {
+            if index > self.last_log_index() || self.term_at(index) != Some(entry.term) {
                 replace_from = Some(index);
                 break;
             }
@@ -475,19 +631,20 @@ impl Ruft {
                 error!("Error persisting AppendEntries log replacement: {err}");
                 return reply;
             }
-            self.log.truncate(index as usize);
+            let local_index = (index - self.snapshot_index) as usize;
+            self.log.truncate(local_index);
             self.log.extend(new_entries);
         }
 
         // Follower 的提交进度不能超过本地已有的最后一条日志。
         // Follower commit index must not pass the last local log entry.
         if args.leader_commit > self.commit_index {
-            let last_new_index = (self.log.len() - 1) as u64;
+            let last_new_index = self.last_log_index();
             self.commit_index = min(args.leader_commit, last_new_index);
             self._apply_committed();
         }
         reply.success = true;
-        reply.match_index = (self.log.len() - 1) as u64;
+        reply.match_index = self.last_log_index();
         reply
     }
 
@@ -516,8 +673,8 @@ impl Ruft {
             vote_granted: false,
         };
 
-        let my_last_log_index = self.log.len() as u64 - 1;
-        let my_last_log_term = self.log[my_last_log_index as usize].term;
+        let my_last_log_index = self.last_log_index();
+        let my_last_log_term = self.last_log_term();
 
         // 日志新旧比较先看最后任期，再看最后索引。
         // Log freshness compares last term first, then last index.
@@ -573,6 +730,95 @@ impl Ruft {
         true
     }
 
+    fn _on_create_snapshot(&mut self, index: u64, data: Vec<u8>) -> bool {
+        if index <= self.snapshot_index || index > self.last_applied {
+            return false;
+        }
+        let Some(term) = self.term_at(index) else {
+            return false;
+        };
+        let snapshot = Snapshot {
+            metadata: SnapshotMetadata {
+                last_included_index: index,
+                last_included_term: term,
+            },
+            data: data.clone(),
+        };
+        if let Err(err) = self.save_persistent_snapshot(snapshot) {
+            error!("Error persisting local snapshot: {err}");
+            return false;
+        }
+        self.compact_in_memory(index, term);
+        self.snapshot_data = Some(data);
+        true
+    }
+
+    async fn _handle_install_snapshot(
+        &mut self,
+        args: InstallSnapshotArgs,
+    ) -> InstallSnapshotReply {
+        if args.term < self.current_term {
+            return InstallSnapshotReply {
+                node_id: self.node_id,
+                term: self.current_term,
+            };
+        }
+
+        if args.term > self.current_term {
+            if let Err(err) = self._refresh_term(args.term) {
+                error!("Error persisting higher term from InstallSnapshot: {err}");
+                return InstallSnapshotReply {
+                    node_id: self.node_id,
+                    term: self.current_term,
+                };
+            }
+        }
+
+        if self.role != Role::Follower {
+            self._become_follower(args.term);
+        }
+        self._reset_election_timer();
+
+        if args.last_included_index <= self.snapshot_index {
+            return InstallSnapshotReply {
+                node_id: self.node_id,
+                term: self.current_term,
+            };
+        }
+
+        let snapshot = Snapshot {
+            metadata: SnapshotMetadata {
+                last_included_index: args.last_included_index,
+                last_included_term: args.last_included_term,
+            },
+            data: args.data.clone(),
+        };
+        if let Err(err) = self.save_persistent_snapshot(snapshot) {
+            error!("Error persisting installed snapshot: {err}");
+            return InstallSnapshotReply {
+                node_id: self.node_id,
+                term: self.current_term,
+            };
+        }
+
+        self.compact_in_memory(args.last_included_index, args.last_included_term);
+        self.snapshot_data = Some(args.data.clone());
+        self.commit_index = self.commit_index.max(args.last_included_index);
+        self.last_applied = self.last_applied.max(args.last_included_index);
+        if let Err(err) = self.apply_sender.send(ApplyMsg::Snapshot {
+            index: args.last_included_index,
+            term: args.last_included_term,
+            data: args.data,
+        }) {
+            error!("Error sending snapshot Apply message: {err}");
+        }
+
+        InstallSnapshotReply {
+            node_id: self.node_id,
+            term: self.current_term,
+        }
+    }
+
     // 选举超时后成为 Candidate：增加任期、投给自己，并向其他节点拉票。
     // On election timeout, become candidate: bump term, vote for self, and request votes.
     fn _become_candidate(&mut self) {
@@ -597,8 +843,8 @@ impl Ruft {
         let args = RequestVoteArgs {
             term: cur_term,
             candidate_id: self.node_id,
-            last_log_index: self.log.len() as u64 - 1,
-            last_log_term: self.log[self.log.len() - 1].term,
+            last_log_index: self.last_log_index(),
+            last_log_term: self.last_log_term(),
         };
         // 并发发起投票，后台汇总结果后再回到事件循环改变状态。
         // Request votes concurrently; the background task reports back via events.
@@ -656,9 +902,10 @@ impl Ruft {
         // 新 Leader 假设每个 Follower 下一条待复制日志是本地日志末尾之后。
         // New leader assumes each follower's next entry starts after the local log tail.
         self.role = Role::Leader;
+        let next = self.last_log_index() + 1;
         self.next_index
             .iter_mut()
-            .for_each(|x| *x.1 = self.log.len() as u64);
+            .for_each(|x| *x.1 = next);
         self.match_index.iter_mut().for_each(|x| *x.1 = 0);
         self._boardcast_append_entries();
     }
@@ -718,13 +965,34 @@ impl Ruft {
         }
     }
 
+    fn _on_install_snapshot_reply(&mut self, reply: InstallSnapshotReply) {
+        if reply.term < self.current_term {
+            return;
+        }
+        if reply.term > self.current_term {
+            if let Err(err) = self._refresh_term(reply.term) {
+                error!("Error persisting higher term from InstallSnapshotReply: {err}");
+            }
+            return;
+        }
+        if self.role != Role::Leader || reply.term != self.current_term {
+            return;
+        }
+        if let Some(match_index) = self.match_index.get_mut(&reply.node_id) {
+            *match_index = self.snapshot_index;
+        }
+        if let Some(next_index) = self.next_index.get_mut(&reply.node_id) {
+            *next_index = self.snapshot_index + 1;
+        }
+    }
+
     // 根据多数派复制进度推进 Leader 的提交索引。
     // Advances the leader commit index based on majority replication progress.
     fn _advance_commit_index(&mut self) {
         let majority = self.members.len() / 2 + 1;
 
-        for index in (self.commit_index + 1)..self.log.len() as u64 {
-            if self.log[index as usize].term != self.current_term {
+        for index in (self.commit_index + 1)..=self.last_log_index() {
+            if self.term_at(index) != Some(self.current_term) {
                 continue;
             }
 
@@ -747,9 +1015,15 @@ impl Ruft {
     fn _apply_committed(&mut self) {
         while self.commit_index > self.last_applied {
             self.last_applied += 1;
+            let Some(entry) = self.entry_at(self.last_applied) else {
+                continue;
+            };
             match self
                 .apply_sender
-                .send(self.log[self.last_applied as usize].command.clone())
+                .send(ApplyMsg::Command {
+                    index: self.last_applied,
+                    data: entry.command.clone(),
+                })
             {
                 Ok(_) => {}
                 Err(err) => {
@@ -767,17 +1041,29 @@ impl Ruft {
 
     // 按目标 Follower 的 next_index 生成 AppendEntries 参数。
     // Builds AppendEntries args for a follower using that follower's next_index.
-    fn _generate_append_entries_args(&self, id: u64) -> AppendEntriesArgs {
+    fn _generate_append_entries_args(&self, id: u64) -> Option<AppendEntriesArgs> {
         let ni = self.next_index[&id];
+        let prev_log_index = ni.checked_sub(1)?;
+        let prev_log_term = self.term_at(prev_log_index)?;
         let args = AppendEntriesArgs {
             term: self.current_term,
             leader_id: self.node_id,
-            prev_log_index: ni - 1,
-            prev_log_term: self.log[(ni - 1) as usize].term,
-            entries: self.log[ni as usize..].to_vec(),
+            prev_log_index,
+            prev_log_term,
+            entries: self.entries_from(ni),
             leader_commit: self.commit_index,
         };
-        args
+        Some(args)
+    }
+
+    fn _generate_install_snapshot_args(&self) -> Option<InstallSnapshotArgs> {
+        self.snapshot_data.as_ref().map(|data| InstallSnapshotArgs {
+            term: self.current_term,
+            leader_id: self.node_id,
+            last_included_index: self.snapshot_index,
+            last_included_term: self.snapshot_term,
+            data: data.clone(),
+        })
     }
 
     // 处理投票汇总结果：多数票晋升，更高任期或失败则退回 Follower。
@@ -821,11 +1107,30 @@ impl RuftHandle {
         rx.await
     }
 
-    // 获取节点状态快照。
-    // Gets a node state snapshot.
-    pub async fn snapshot(&self) -> Result<RuftSnapshot, tokio::sync::oneshot::error::RecvError> {
+    // 获取节点当前信息。
+    // Gets a node current info.
+    pub async fn get_info(&self) -> Result<RuftInfo, tokio::sync::oneshot::error::RecvError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if self.event_sender.send(Event::Snapshot(tx)).await.is_err() {
+        if self.event_sender.send(Event::GetInfo(tx)).await.is_err() {
+            return Err(rx.await.unwrap_err());
+        }
+        rx.await
+    }
+
+    // 请求节点基于上层状态机数据创建快照并压缩日志。
+    // Requests snapshot creation from upper state-machine data and compacts the log.
+    pub async fn create_snapshot(
+        &self,
+        index: u64,
+        data: Vec<u8>,
+    ) -> Result<bool, tokio::sync::oneshot::error::RecvError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .event_sender
+            .send(Event::CreateSnapshot(index, data, tx))
+            .await
+            .is_err()
+        {
             return Err(rx.await.unwrap_err());
         }
         rx.await
@@ -966,6 +1271,7 @@ mod tests {
                 voted_for: Some(3),
             },
             log: vec![entry(0, b""), entry(2, b"old"), entry(4, b"new")],
+            snapshot: None,
         })
         .expect("valid storage state");
 
@@ -981,11 +1287,12 @@ mod tests {
     #[tokio::test]
     async fn new_with_persistent_flag_restores_from_default_storage_dir() {
         let node_id = 10_001;
-        let storage_dir = Ruft::default_storage_dir(node_id);
+        let storage_dir = Ruft::default_storage_dir();
         let _ = fs::remove_dir_all(&storage_dir);
 
         {
-            let mut storage = FileStorage::open(&storage_dir).expect("open default file storage");
+            let mut storage =
+                FileStorage::open(&storage_dir, node_id).expect("open default file storage");
             storage
                 .save_hard_state(HardState {
                     current_term: 6,
@@ -1020,7 +1327,7 @@ mod tests {
     async fn new_restores_persistent_state_from_file_storage() {
         let dir = TempDir::new().expect("temp dir");
         {
-            let mut storage = FileStorage::open(dir.path()).expect("open file storage");
+            let mut storage = FileStorage::open(dir.path(), 1).expect("open file storage");
             storage
                 .save_hard_state(HardState {
                     current_term: 4,
@@ -1033,7 +1340,7 @@ mod tests {
             storage.sync().expect("sync");
         }
 
-        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        let storage = FileStorage::open(dir.path(), 1).expect("reopen file storage");
         let node = test_node_with_file_storage(1, vec![1, 2, 3], storage);
 
         assert_eq!(node.current_term, 4);
@@ -1051,6 +1358,7 @@ mod tests {
                 voted_for: None,
             },
             log: vec![entry(0, b"")],
+            snapshot: None,
         })
         .expect("valid storage state");
         let mut node = test_node_with_storage(1, vec![1, 2, 3], storage);
@@ -1066,7 +1374,7 @@ mod tests {
     #[tokio::test]
     async fn leader_append_log_persists_entry_to_file_storage() {
         let dir = TempDir::new().expect("temp dir");
-        let storage = FileStorage::open(dir.path()).expect("open file storage");
+        let storage = FileStorage::open(dir.path(), 1).expect("open file storage");
         let mut node = test_node_with_file_storage(1, vec![1, 2, 3], storage);
         node.current_term = 1;
         node.role = Role::Leader;
@@ -1074,7 +1382,7 @@ mod tests {
         assert!(node._on_append_log(b"entry".to_vec()));
         drop(node);
 
-        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        let storage = FileStorage::open(dir.path(), 1).expect("reopen file storage");
         assert_eq!(
             storage.load().expect("load storage").log,
             vec![entry(0, b""), entry(1, b"entry")]
@@ -1089,6 +1397,7 @@ mod tests {
                 voted_for: None,
             },
             log: vec![entry(0, b""), entry(1, b"keep"), entry(1, b"stale")],
+            snapshot: None,
         })
         .expect("valid storage state");
         let mut node = test_node_with_storage(1, vec![1, 2, 3], storage);
@@ -1114,7 +1423,7 @@ mod tests {
     async fn append_entries_conflict_replacement_persists_to_file_storage() {
         let dir = TempDir::new().expect("temp dir");
         {
-            let mut storage = FileStorage::open(dir.path()).expect("open file storage");
+            let mut storage = FileStorage::open(dir.path(), 1).expect("open file storage");
             storage
                 .save_hard_state(HardState {
                     current_term: 1,
@@ -1127,7 +1436,7 @@ mod tests {
             storage.sync().expect("sync");
         }
 
-        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        let storage = FileStorage::open(dir.path(), 1).expect("reopen file storage");
         let mut node = test_node_with_file_storage(1, vec![1, 2, 3], storage);
         let reply = node
             ._handle_append_entries(AppendEntriesArgs {
@@ -1143,7 +1452,7 @@ mod tests {
         assert!(reply.success);
         drop(node);
 
-        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        let storage = FileStorage::open(dir.path(), 1).expect("reopen file storage");
         assert_eq!(
             storage.load().expect("load storage").log,
             vec![entry(0, b""), entry(1, b"keep"), entry(2, b"replace")]
@@ -1385,5 +1694,142 @@ mod tests {
         .await;
 
         assert_eq!(node.commit_index, 0);
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_compacts_applied_prefix() {
+        let storage = MemoryStorage::with_state(StorageState {
+            hard_state: HardState::default(),
+            log: vec![
+                entry(0, b""),
+                entry(1, b"one"),
+                entry(2, b"two"),
+                entry(3, b"three"),
+            ],
+            snapshot: None,
+        })
+        .expect("valid storage state");
+        let mut node = test_node_with_storage(1, vec![1, 2, 3], storage);
+        node.commit_index = 3;
+        node.last_applied = 3;
+
+        assert!(node._on_create_snapshot(2, b"state".to_vec()));
+
+        assert_eq!(node.snapshot_index, 2);
+        assert_eq!(node.snapshot_term, 2);
+        assert_eq!(node.log, vec![entry(2, b""), entry(3, b"three")]);
+        let state = node.storage.load().expect("load storage");
+        assert_eq!(state.snapshot.expect("snapshot").data, b"state".to_vec());
+        assert_eq!(state.log, node.log);
+    }
+
+    #[tokio::test]
+    async fn create_snapshot_rejects_unapplied_index() {
+        let mut node = new_test_node(1, vec![1, 2, 3]);
+        node.log = vec![entry(0, b""), entry(1, b"one")];
+        node.commit_index = 1;
+        node.last_applied = 0;
+
+        assert!(!node._on_create_snapshot(1, b"state".to_vec()));
+        assert_eq!(node.snapshot_index, 0);
+    }
+
+    #[tokio::test]
+    async fn append_entries_accepts_snapshot_boundary() {
+        let snapshot = Snapshot {
+            metadata: SnapshotMetadata {
+                last_included_index: 2,
+                last_included_term: 2,
+            },
+            data: b"state".to_vec(),
+        };
+        let storage = MemoryStorage::with_state(StorageState {
+            hard_state: HardState::default(),
+            log: vec![entry(2, b""), entry(3, b"old")],
+            snapshot: Some(snapshot),
+        })
+        .expect("valid storage state");
+        let mut node = test_node_with_storage(1, vec![1, 2, 3], storage);
+
+        let reply = node
+            ._handle_append_entries(AppendEntriesArgs {
+                term: 3,
+                leader_id: 2,
+                prev_log_index: 2,
+                prev_log_term: 2,
+                entries: vec![entry(4, b"new")],
+                leader_commit: 3,
+            })
+            .await;
+
+        assert!(reply.success);
+        assert_eq!(node.log, vec![entry(2, b""), entry(4, b"new")]);
+        assert_eq!(node.commit_index, 3);
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_compacts_log_and_emits_apply_snapshot() {
+        let mut node = new_test_node(1, vec![1, 2, 3]);
+        let mut apply = node.take_apply();
+        node.log = vec![entry(0, b""), entry(1, b"one")];
+
+        let reply = node
+            ._handle_install_snapshot(InstallSnapshotArgs {
+                term: 4,
+                leader_id: 2,
+                last_included_index: 5,
+                last_included_term: 4,
+                data: b"state".to_vec(),
+            })
+            .await;
+
+        assert_eq!(reply.term, 4);
+        assert_eq!(node.snapshot_index, 5);
+        assert_eq!(node.snapshot_term, 4);
+        assert_eq!(node.commit_index, 5);
+        assert_eq!(node.last_applied, 5);
+        assert_eq!(node.log, vec![entry(4, b"")]);
+        assert_eq!(
+            apply.try_recv().expect("snapshot apply"),
+            ApplyMsg::Snapshot {
+                index: 5,
+                term: 4,
+                data: b"state".to_vec()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn request_vote_uses_snapshot_last_log_when_log_is_compacted() {
+        let snapshot = Snapshot {
+            metadata: SnapshotMetadata {
+                last_included_index: 7,
+                last_included_term: 3,
+            },
+            data: b"state".to_vec(),
+        };
+        let storage = MemoryStorage::with_state(StorageState {
+            hard_state: HardState::default(),
+            log: vec![entry(3, b"")],
+            snapshot: Some(snapshot),
+        })
+        .expect("valid storage state");
+        let mut node = test_node_with_storage(1, vec![1, 2], storage);
+
+        let stale = node._handle_request_vote(RequestVoteArgs {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 6,
+            last_log_term: 3,
+        });
+        assert!(!stale.vote_granted);
+
+        let fresh = node._handle_request_vote(RequestVoteArgs {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 7,
+            last_log_term: 3,
+        });
+        assert!(fresh.vote_granted);
     }
 }

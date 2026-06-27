@@ -1,6 +1,7 @@
 use crate::events::event::Event;
 use crate::rpc::append_entries::{AppendEntriesArgs, AppendEntriesReply};
 use crate::rpc::client::NodeId;
+use crate::rpc::install_snapshot::{InstallSnapshotArgs, InstallSnapshotReply};
 use crate::rpc::request_vote::{RequestVoteArgs, RequestVoteReply};
 use crate::rpc::rpc::Rpc;
 use log::error;
@@ -48,6 +49,15 @@ impl RuftServer {
             vote_granted: false,
         }
     }
+
+    // InstallSnapshot 出错时没有读取节点状态，统一用 term=0 表示本地转发失败。
+    // On InstallSnapshot forwarding errors, term=0 represents a local forwarding failure.
+    fn install_snapshot_error(&self) -> InstallSnapshotReply {
+        InstallSnapshotReply {
+            node_id: self.node_id,
+            term: 0,
+        }
+    }
 }
 
 impl Rpc for RuftServer {
@@ -85,6 +95,27 @@ impl Rpc for RuftServer {
             Err(err) => {
                 error!("Error receiving RequestVote reply: {err}");
                 self.request_vote_error()
+            }
+        }
+    }
+
+    // tarpc 快照安装入口，通过事件循环串行处理。
+    // tarpc snapshot entrypoint, serialized through the event loop.
+    async fn install_snapshot(
+        self,
+        _ctx: context::Context,
+        args: InstallSnapshotArgs,
+    ) -> InstallSnapshotReply {
+        let (tx, rx) = oneshot::channel();
+        if let Err(err) = self.event_sender.send(Event::InstallSnapshot(args, tx)).await {
+            error!("Error sending InstallSnapshot event: {err}");
+            return self.install_snapshot_error();
+        }
+        match rx.await {
+            Ok(reply) => reply,
+            Err(err) => {
+                error!("Error receiving InstallSnapshot reply: {err}");
+                self.install_snapshot_error()
             }
         }
     }

@@ -1,15 +1,14 @@
 mod file;
 mod memory;
 
+use crate::rpc::client::NodeId;
+use crate::ruft::{LogEntry, Snapshot};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use crate::rpc::client::NodeId;
-use crate::utilis::types::LogEntry;
-use serde::{Deserialize, Serialize};
-
 pub use file::FileStorage;
 pub use memory::MemoryStorage;
+use serde::{Deserialize, Serialize};
 
 // 存储层统一结果类型，便于后续文件 WAL 和快照实现复用。
 // Shared storage result type, reusable by future file WAL and snapshot backends.
@@ -75,6 +74,7 @@ impl Default for HardState {
 pub struct StorageState {
     pub hard_state: HardState, // 持久化任期和投票状态。Persisted term and vote state.
     pub log: Vec<LogEntry>,    // 持久化日志；log[0] 是空哨兵。Persisted log; log[0] is sentinel.
+    pub snapshot: Option<Snapshot>,
 }
 
 // Raft 存储抽象：状态机只依赖这些语义，不关心底层是内存、WAL 还是快照。
@@ -107,6 +107,13 @@ pub trait Storage: Send + Sync {
     // 刷盘边界；内存实现为空操作，文件实现应在这里 fsync。
     // Flush boundary; memory is a no-op, file backends should fsync here.
     fn sync(&mut self) -> StorageResult<()>;
+
+    fn save_snapshot(&mut self, snapshot: Snapshot) -> StorageResult<()>;
+    fn compact_log(
+        &mut self,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> StorageResult<()>;
 }
 
 // 创建当前实现统一使用的空哨兵日志，保持 Raft 日志索引从 1 开始。
@@ -121,11 +128,11 @@ pub(crate) fn sentinel_log_entry() -> LogEntry {
 // 校验恢复出的日志是否保留哨兵项，防止后续索引计算越界或错位。
 // Validates the sentinel entry so later index calculations stay aligned.
 pub(crate) fn validate_sentinel_log(log: &[LogEntry]) -> StorageResult<()> {
-    if log.first() == Some(&sentinel_log_entry()) {
+    if log.first().is_some_and(|entry| entry.command.is_empty()) {
         return Ok(());
     }
 
     Err(StorageError::InvalidOperation(
-        "log must start with the empty term-0 sentinel entry".to_string(),
+        "log must start with an empty sentinel entry".to_string(),
     ))
 }

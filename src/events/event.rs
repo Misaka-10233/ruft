@@ -1,6 +1,7 @@
 use crate::rpc::append_entries::{AppendEntriesArgs, AppendEntriesReply};
+use crate::rpc::install_snapshot::{InstallSnapshotArgs, InstallSnapshotReply};
 use crate::rpc::request_vote::{RequestVoteArgs, RequestVoteReply};
-use crate::ruft::RuftSnapshot;
+use crate::ruft::RuftInfo;
 use tokio::sync::oneshot;
 
 // 节点内部事件：把 RPC、计时器和本地命令统一串到单线程状态机中。
@@ -12,9 +13,9 @@ pub enum Event {
     // 收到 Candidate 的投票请求，并通过 oneshot 返回响应。
     // Received RequestVote from a candidate; reply through oneshot.
     RequestVote(RequestVoteArgs, oneshot::Sender<RequestVoteReply>),
-    // 将已提交但尚未应用的日志推送给上层状态机。
-    // Apply committed but not-yet-applied log entries to the upper state machine.
-    Apply,
+    // 收到 Leader 的快照安装请求，并通过 oneshot 返回响应。
+    // Received InstallSnapshot from the leader; reply through oneshot.
+    InstallSnapshot(InstallSnapshotArgs, oneshot::Sender<InstallSnapshotReply>),
     // 选举超时，Follower/Candidate 会尝试发起新一轮选举。
     // Election timeout; follower/candidate may start a new election round.
     ElectionTimeout,
@@ -33,10 +34,16 @@ pub enum Event {
     // Follower 对日志复制的响应，用于推进或回退复制进度。
     // AppendEntries response from a follower; advances or backs off replication.
     AppendEntriesReply(AppendEntriesReply),
+    // Follower 对快照安装的响应，用于推进复制进度或退位。
+    // InstallSnapshot response from a follower; advances replication or steps down.
+    InstallSnapshotReply(InstallSnapshotReply),
     // 客户端提交的新命令，只有 Leader 会追加到日志。
     // New client command; only the leader appends it to the log.
     NewLogEntries(Vec<u8>, oneshot::Sender<bool>),
+    // 上层状态机提交快照数据，请求 Raft 压缩已经应用的日志前缀。
+    // Upper state machine submits snapshot data to compact an applied log prefix.
+    CreateSnapshot(u64, Vec<u8>, oneshot::Sender<bool>),
     // 读取当前节点状态快照，供外部监控和集成测试观测。
     // Reads a state snapshot for external monitoring and integration tests.
-    Snapshot(oneshot::Sender<RuftSnapshot>),
+    GetInfo(oneshot::Sender<RuftInfo>),
 }

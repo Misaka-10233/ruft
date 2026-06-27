@@ -4,18 +4,22 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::rpc::client::NodeId;
+use crate::ruft::{LogEntry, Snapshot};
 use crate::storage::{
     HardState, Storage, StorageError, StorageResult, StorageState, sentinel_log_entry,
     validate_sentinel_log,
 };
-use crate::utilis::types::LogEntry;
+use crate::storage::memory::compact_log_state;
 
 // WAL 文件头包含 magic 和版本号；后续扩展格式时应新版本化而不是静默兼容。
 // WAL header contains magic and version; future format changes should version this explicitly.
-const WAL_HEADER: &[u8; 8] = b"RUFTWAL1";
-const WAL_FILE_NAME: &str = "0000000000000001.wal";
+const WAL_HEADER: &[u8; 7] = b"RUFTWAL";
+const WAL_FILE_NAME: &str = "node.wal";
 const HARD_STATE_FILE_NAME: &str = "hard_state";
 const HARD_STATE_TMP_FILE_NAME: &str = "hard_state.tmp";
+const SNAPSHOT_FILE_PATH: &str = "snapshot";
+const SNAPSHOT_TMP_FILE_PATH: &str = "snapshot.tmp";
 
 // WAL 只记录会改变日志镜像的操作；恢复时按顺序回放即可得到完整 log。
 // WAL records only log-mutating operations; replaying them in order reconstructs the log.
@@ -36,8 +40,8 @@ enum WalRecord {
 // File storage backend: hard_state is atomically replaced, log uses a single WAL segment.
 #[derive(Debug)]
 pub struct FileStorage {
-    // 节点持久化根目录；hard_state 和 wal/ 都位于此目录下。
-    // Persistent root directory for this node; hard_state and wal/ live under it.
+    // 节点持久化目录；hard_state 和 wal/ 都位于此目录下。
+    // Persistent directory for this node; hard_state and wal/ live under it.
     root_dir: PathBuf,
     // hard_state 文件路径，保存 current_term 和 voted_for。
     // Path to the hard_state file storing current_term and voted_for.
@@ -45,6 +49,9 @@ pub struct FileStorage {
     // 当前单段 WAL 文件句柄；追加记录和 sync 都复用它。
     // Handle to the current single-segment WAL file, reused for appends and sync.
     wal_file: File,
+
+    snapshot_path: PathBuf,
+    compact_base_index: u64,
     // 从磁盘恢复后维护的内存镜像，避免每次 load 都重新回放 WAL。
     // In-memory mirror restored from disk, avoiding WAL replay on every load.
     state: StorageState,
@@ -53,23 +60,36 @@ pub struct FileStorage {
 impl FileStorage {
     // 打开或创建持久化存储，并从 hard_state + WAL 恢复完整持久状态。
     // Opens or creates persistent storage, then restores state from hard_state + WAL.
-    pub fn open(root: impl AsRef<Path>) -> StorageResult<Self> {
-        let root_dir = root.as_ref().to_path_buf();
+    pub fn open(root: impl AsRef<Path>, node_id: NodeId) -> StorageResult<Self> {
+        let root_dir = node_storage_dir(root.as_ref(), node_id);
         let wal_dir = root_dir.join("wal");
         let hard_state_path = root_dir.join(HARD_STATE_FILE_NAME);
+        let snapshot_path = root_dir.join(SNAPSHOT_FILE_PATH);
         let wal_path = wal_dir.join(WAL_FILE_NAME);
 
         fs::create_dir_all(&wal_dir)?;
 
         let hard_state = load_hard_state(&hard_state_path)?;
+        let snapshot = load_snapshot(&snapshot_path)?;
         let mut wal_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(&wal_path)?;
 
-        let log = load_wal(&mut wal_file)?;
-        let state = StorageState { hard_state, log };
+        let mut log = load_wal(&mut wal_file)?;
+        if let Some(snapshot) = &snapshot {
+            log[0].term = snapshot.metadata.last_included_term;
+        }
+        let compact_base_index = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.metadata.last_included_index)
+            .unwrap_or(0);
+        let state = StorageState {
+            hard_state,
+            log,
+            snapshot,
+        };
         validate_sentinel_log(&state.log)?;
 
         wal_file.seek(SeekFrom::End(0))?;
@@ -78,6 +98,8 @@ impl FileStorage {
             root_dir,
             hard_state_path,
             wal_file,
+            snapshot_path,
+            compact_base_index,
             state,
         })
     }
@@ -97,6 +119,23 @@ impl FileStorage {
         self.wal_file.write_all(&len.to_le_bytes())?;
         self.wal_file.write_all(&crc.to_le_bytes())?;
         self.wal_file.write_all(&payload)?;
+        Ok(())
+    }
+
+    fn rewrite_wal(&mut self) -> StorageResult<()> {
+        self.wal_file.set_len(0)?;
+        self.wal_file.seek(SeekFrom::Start(0))?;
+        self.wal_file.write_all(WAL_HEADER)?;
+        let tail = if self.state.log.len() > 1 {
+            self.state.log[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+        if !tail.is_empty() {
+            self.append_record(&WalRecord::Append(tail))?;
+        }
+        self.wal_file.flush()?;
+        self.wal_file.sync_data()?;
         Ok(())
     }
 
@@ -195,6 +234,44 @@ impl Storage for FileStorage {
         self.wal_file.sync_data()?;
         Ok(())
     }
+
+    fn save_snapshot(&mut self, snapshot: crate::ruft::Snapshot) -> StorageResult<()> {
+        let temp_path = self.root_dir.join(SNAPSHOT_TMP_FILE_PATH);
+        let encoded = bincode::serialize(&snapshot)
+            .map_err(|err| StorageError::InvalidOperation(format!("serialize snapshot: {err}")))?;
+        {
+            let mut tmp = File::create(&temp_path)?;
+            tmp.write_all(&encoded)?;
+            tmp.flush()?;
+            tmp.sync_all()?;
+        }
+
+        fs::rename(temp_path, &self.snapshot_path)?;
+        sync_dir_best_effort(&self.root_dir);
+        self.state.snapshot = Some(snapshot);
+        Ok(())
+    }
+
+    fn compact_log(
+        &mut self,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> StorageResult<()> {
+        if last_included_index < self.compact_base_index {
+            return Err(StorageError::InvalidOperation(format!(
+                "compact index {last_included_index} is before base index {}",
+                self.compact_base_index
+            )));
+        }
+        let local_index = last_included_index - self.compact_base_index;
+        compact_log_state(
+            &mut self.state.log,
+            local_index,
+            last_included_term,
+        )?;
+        self.compact_base_index = last_included_index;
+        self.rewrite_wal()
+    }
 }
 
 // 读取 hard_state；缺失表示首次启动，损坏则拒绝启动。
@@ -204,6 +281,16 @@ fn load_hard_state(path: &Path) -> StorageResult<HardState> {
         Ok(bytes) => bincode::deserialize(&bytes)
             .map_err(|err| StorageError::Corruption(format!("invalid hard_state file: {err}"))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HardState::default()),
+        Err(err) => Err(StorageError::Io(err)),
+    }
+}
+
+fn load_snapshot(path: &Path) -> StorageResult<Option<Snapshot>> {
+    match fs::read(path) {
+        Ok(bytes) => bincode::deserialize(&bytes)
+            .map(Some)
+            .map_err(|err| StorageError::Corruption(format!("invalid snapshot file: {err}"))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(StorageError::Io(err)),
     }
 }
@@ -348,6 +435,14 @@ fn checksum(payload: &[u8]) -> u32 {
     !crc
 }
 
+fn node_storage_dir(root: &Path, node_id: NodeId) -> PathBuf {
+    root.join(format!("node-{:08x}", node_id_hash(node_id)))
+}
+
+fn node_id_hash(node_id: NodeId) -> u32 {
+    checksum(&node_id.to_le_bytes())
+}
+
 // 尽力同步目录元数据；不支持目录 fsync 的平台上静默退化。
 // Best-effort directory metadata sync; silently degrades on platforms without directory fsync.
 fn sync_dir_best_effort(path: &Path) {
@@ -403,18 +498,57 @@ mod tests {
         }
     }
 
+    const TEST_NODE_ID: NodeId = 42;
+
+    fn open_storage(dir: &TempDir) -> StorageResult<FileStorage> {
+        FileStorage::open(dir.path(), TEST_NODE_ID)
+    }
+
     fn wal_path(dir: &TempDir) -> PathBuf {
-        dir.path().join("wal").join(WAL_FILE_NAME)
+        node_storage_dir(dir.path(), TEST_NODE_ID)
+            .join("wal")
+            .join(WAL_FILE_NAME)
+    }
+
+    fn hard_state_path(dir: &TempDir) -> PathBuf {
+        node_storage_dir(dir.path(), TEST_NODE_ID).join(HARD_STATE_FILE_NAME)
+    }
+
+    fn snapshot(index: u64, term: u64, data: &[u8]) -> Snapshot {
+        Snapshot {
+            metadata: crate::ruft::SnapshotMetadata {
+                last_included_index: index,
+                last_included_term: term,
+            },
+            data: data.to_vec(),
+        }
     }
 
     #[test]
     fn open_empty_directory_loads_default_state() {
         let dir = TempDir::new().expect("temp dir");
-        let storage = FileStorage::open(dir.path()).expect("open file storage");
+        let storage = open_storage(&dir).expect("open file storage");
 
         let state = storage.load().expect("load");
         assert_eq!(state.hard_state, HardState::default());
         assert_eq!(state.log, vec![sentinel_log_entry()]);
+    }
+
+    #[test]
+    fn open_uses_hashed_node_id_directory() {
+        let dir = TempDir::new().expect("temp dir");
+        let node_id = 7;
+        let storage = FileStorage::open(dir.path(), node_id).expect("open file storage");
+
+        assert_eq!(storage.root_dir, node_storage_dir(dir.path(), node_id));
+        assert!(storage.root_dir.exists());
+        assert!(
+            storage
+                .root_dir
+                .ends_with(format!("node-{:08x}", node_id_hash(node_id)))
+        );
+        assert!(storage.root_dir.join("wal").join(WAL_FILE_NAME).exists());
+        assert!(!dir.path().join("wal").exists());
     }
 
     #[test]
@@ -426,13 +560,15 @@ mod tests {
         };
 
         {
-            let mut storage = FileStorage::open(dir.path()).expect("open file storage");
+            let mut storage = open_storage(&dir).expect("open file storage");
             storage
                 .save_hard_state(hard_state.clone())
                 .expect("save hard state");
         }
 
-        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        assert!(hard_state_path(&dir).exists());
+
+        let storage = open_storage(&dir).expect("reopen file storage");
         assert_eq!(storage.load().expect("load").hard_state, hard_state);
     }
 
@@ -442,12 +578,12 @@ mod tests {
         let entries = vec![entry(1, b"one"), entry(2, b"two")];
 
         {
-            let mut storage = FileStorage::open(dir.path()).expect("open file storage");
+            let mut storage = open_storage(&dir).expect("open file storage");
             storage.append_entries(&entries).expect("append");
             storage.sync().expect("sync");
         }
 
-        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        let storage = open_storage(&dir).expect("reopen file storage");
         assert_eq!(
             storage.load().expect("load").log,
             vec![sentinel_log_entry(), entry(1, b"one"), entry(2, b"two")]
@@ -455,11 +591,32 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_and_compacted_log_survive_reopen_without_old_wal_prefix() {
+        let dir = TempDir::new().expect("temp dir");
+        let snap = snapshot(2, 2, b"state");
+
+        {
+            let mut storage = open_storage(&dir).expect("open file storage");
+            storage
+                .append_entries(&[entry(1, b"one"), entry(2, b"two"), entry(3, b"three")])
+                .expect("append");
+            storage.save_snapshot(snap.clone()).expect("save snapshot");
+            storage.compact_log(2, 2).expect("compact");
+            storage.sync().expect("sync");
+        }
+
+        let storage = open_storage(&dir).expect("reopen file storage");
+        let state = storage.load().expect("load");
+        assert_eq!(state.snapshot, Some(snap));
+        assert_eq!(state.log, vec![entry(2, b""), entry(3, b"three")]);
+    }
+
+    #[test]
     fn replace_suffix_survives_reopen() {
         let dir = TempDir::new().expect("temp dir");
 
         {
-            let mut storage = FileStorage::open(dir.path()).expect("open file storage");
+            let mut storage = open_storage(&dir).expect("open file storage");
             storage
                 .append_entries(&[entry(1, b"keep"), entry(1, b"stale")])
                 .expect("append");
@@ -469,7 +626,7 @@ mod tests {
             storage.sync().expect("sync");
         }
 
-        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        let storage = open_storage(&dir).expect("reopen file storage");
         assert_eq!(
             storage.load().expect("load").log,
             vec![sentinel_log_entry(), entry(1, b"keep"), entry(2, b"new")]
@@ -479,7 +636,7 @@ mod tests {
     #[test]
     fn truncate_suffix_survives_reopen_and_validates_bounds() {
         let dir = TempDir::new().expect("temp dir");
-        let mut storage = FileStorage::open(dir.path()).expect("open file storage");
+        let mut storage = open_storage(&dir).expect("open file storage");
         storage
             .append_entries(&[entry(1, b"one"), entry(1, b"two")])
             .expect("append");
@@ -497,7 +654,7 @@ mod tests {
         storage.sync().expect("sync");
         drop(storage);
 
-        let storage = FileStorage::open(dir.path()).expect("reopen file storage");
+        let storage = open_storage(&dir).expect("reopen file storage");
         assert_eq!(
             storage.load().expect("load").log,
             vec![sentinel_log_entry()]
@@ -509,7 +666,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
 
         {
-            let mut storage = FileStorage::open(dir.path()).expect("open file storage");
+            let mut storage = open_storage(&dir).expect("open file storage");
             storage.append_entries(&[entry(1, b"one")]).expect("append");
             storage.sync().expect("sync");
         }
@@ -523,7 +680,7 @@ mod tests {
         file.flush().expect("flush");
         drop(file);
 
-        let storage = FileStorage::open(dir.path()).expect("reopen truncates tail");
+        let storage = open_storage(&dir).expect("reopen truncates tail");
         assert_eq!(
             storage.load().expect("load").log,
             vec![sentinel_log_entry(), entry(1, b"one")]
@@ -538,7 +695,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
 
         {
-            let mut storage = FileStorage::open(dir.path()).expect("open file storage");
+            let mut storage = open_storage(&dir).expect("open file storage");
             storage.append_entries(&[entry(1, b"one")]).expect("append");
             storage.sync().expect("sync");
         }
@@ -548,7 +705,7 @@ mod tests {
         bytes[payload_offset] ^= 0x01;
         fs::write(wal_path(&dir), bytes).expect("write corrupted wal");
 
-        let err = FileStorage::open(dir.path()).expect_err("corruption should fail");
+        let err = open_storage(&dir).expect_err("corruption should fail");
         assert!(matches!(err, StorageError::Corruption(_)));
     }
 }

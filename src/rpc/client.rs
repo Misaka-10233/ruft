@@ -4,6 +4,7 @@ use tarpc::client::RpcError;
 
 use crate::rpc::{
     append_entries::{AppendEntriesArgs, AppendEntriesReply},
+    install_snapshot::{InstallSnapshotArgs, InstallSnapshotReply},
     request_vote::{RequestVoteArgs, RequestVoteReply},
     rpc::RpcClient,
 };
@@ -37,6 +38,17 @@ impl RuftClient {
         args: AppendEntriesArgs,
     ) -> impl Future<Output = Result<AppendEntriesReply, RpcError>> + '_ {
         self.conn[&node_id].append_entries(ctx, args)
+    }
+
+    // 向指定节点发送 InstallSnapshot，用于修复落后于快照边界的副本。
+    // Sends InstallSnapshot to a peer that is behind the compacted snapshot boundary.
+    pub fn call_install_snapshot(
+        &self,
+        node_id: NodeId,
+        ctx: tarpc::context::Context,
+        args: InstallSnapshotArgs,
+    ) -> impl Future<Output = Result<InstallSnapshotReply, RpcError>> + '_ {
+        self.conn[&node_id].install_snapshot(ctx, args)
     }
 
     // 向除自己外的所有节点并发发送 RequestVote。

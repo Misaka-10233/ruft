@@ -1,8 +1,8 @@
+use crate::ruft::{LogEntry, Snapshot};
 use crate::storage::{
     HardState, Storage, StorageError, StorageResult, StorageState, sentinel_log_entry,
     validate_sentinel_log,
 };
-use crate::utilis::types::LogEntry;
 
 // 内存存储实现：主要用于测试和默认无持久化场景。
 // In-memory storage backend: mainly for tests and default non-durable use.
@@ -11,6 +11,7 @@ pub struct MemoryStorage {
     // 当前持久状态的内存副本。
     // In-memory copy of the persistent state.
     state: StorageState,
+    compact_base_index: u64,
 }
 
 impl MemoryStorage {
@@ -21,7 +22,9 @@ impl MemoryStorage {
             state: StorageState {
                 hard_state: HardState::default(),
                 log: vec![sentinel_log_entry()],
+                snapshot: None,
             },
+            compact_base_index: 0,
         }
     }
 
@@ -29,7 +32,15 @@ impl MemoryStorage {
     // Creates storage from a supplied state; useful for recovery-path tests.
     pub fn with_state(state: StorageState) -> StorageResult<Self> {
         validate_sentinel_log(&state.log)?;
-        Ok(Self { state })
+        let compact_base_index = state
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.metadata.last_included_index)
+            .unwrap_or(0);
+        Ok(Self {
+            state,
+            compact_base_index,
+        })
     }
 }
 
@@ -108,11 +119,51 @@ impl Storage for MemoryStorage {
     fn sync(&mut self) -> StorageResult<()> {
         Ok(())
     }
+
+    fn save_snapshot(&mut self, snapshot: Snapshot) -> StorageResult<()> {
+        self.state.snapshot = Some(snapshot);
+        Ok(())
+    }
+
+    fn compact_log(
+        &mut self,
+        last_included_index: u64,
+        last_included_term: u64,
+    ) -> StorageResult<()> {
+        if last_included_index < self.compact_base_index {
+            return Err(StorageError::InvalidOperation(format!(
+                "compact index {last_included_index} is before base index {}",
+                self.compact_base_index
+            )));
+        }
+        let local_index = last_included_index - self.compact_base_index;
+        compact_log_state(&mut self.state.log, local_index, last_included_term)?;
+        self.compact_base_index = last_included_index;
+        Ok(())
+    }
+}
+
+pub(crate) fn compact_log_state(
+    log: &mut Vec<LogEntry>,
+    local_included_index: u64,
+    last_included_term: u64,
+) -> StorageResult<()> {
+    let len = log.len() as u64;
+    let mut compacted = vec![LogEntry {
+        term: last_included_term,
+        command: Vec::new(),
+    }];
+    if local_included_index + 1 < len {
+        compacted.extend_from_slice(&log[(local_included_index + 1) as usize..]);
+    }
+    *log = compacted;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ruft::SnapshotMetadata;
 
     fn entry(term: u64, command: &[u8]) -> LogEntry {
         LogEntry {
@@ -289,10 +340,35 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_and_compaction_update_loaded_state() {
+        let mut storage = MemoryStorage::new();
+        storage
+            .append_entries(&[entry(1, b"one"), entry(2, b"two"), entry(3, b"three")])
+            .expect("append");
+        let snapshot = Snapshot {
+            metadata: SnapshotMetadata {
+                last_included_index: 2,
+                last_included_term: 2,
+            },
+            data: b"state".to_vec(),
+        };
+
+        storage
+            .save_snapshot(snapshot.clone())
+            .expect("save snapshot");
+        storage.compact_log(2, 2).expect("compact");
+
+        let state = storage.load().expect("load");
+        assert_eq!(state.snapshot, Some(snapshot));
+        assert_eq!(state.log, vec![entry(2, b""), entry(3, b"three")]);
+    }
+
+    #[test]
     fn with_state_rejects_missing_sentinel() {
         let state = StorageState {
             hard_state: HardState::default(),
             log: vec![entry(1, b"not sentinel")],
+            snapshot: None,
         };
 
         let err = MemoryStorage::with_state(state).expect_err("state should fail validation");
