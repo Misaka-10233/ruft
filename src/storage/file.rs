@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::rpc::client::NodeId;
 use crate::ruft::{LogEntry, Snapshot};
-use crate::storage::{
-    HardState, Storage, StorageError, StorageResult, StorageState, sentinel_log_entry,
-    validate_sentinel_log,
-};
 use crate::storage::memory::compact_log_state;
+use crate::storage::{
+    HardState, Storage, StorageError, StorageResult, StorageState, checksum, sentinel_log_entry,
+    utils, validate_sentinel_log,
+};
 
 // WAL 文件头包含 magic 和版本号；后续扩展格式时应新版本化而不是静默兼容。
 // WAL header contains magic and version; future format changes should version this explicitly.
@@ -33,6 +33,12 @@ enum WalRecord {
     ReplaceSuffix {
         first_index_to_remove: u64,
         entries: Vec<LogEntry>,
+    },
+    // 声明后续记录相对于哪个绝对日志索引；压缩重写 WAL 时首先写入。
+    // Declares the absolute log index subsequent records are relative to.
+    SetBase {
+        index: u64,
+        term: u64,
     },
 }
 
@@ -61,7 +67,7 @@ impl FileStorage {
     // 打开或创建持久化存储，并从 hard_state + WAL 恢复完整持久状态。
     // Opens or creates persistent storage, then restores state from hard_state + WAL.
     pub fn open(root: impl AsRef<Path>, node_id: NodeId) -> StorageResult<Self> {
-        let root_dir = node_storage_dir(root.as_ref(), node_id);
+        let root_dir = utils::node_storage_dir(root.as_ref(), node_id);
         let wal_dir = root_dir.join("wal");
         let hard_state_path = root_dir.join(HARD_STATE_FILE_NAME);
         let snapshot_path = root_dir.join(SNAPSHOT_FILE_PATH);
@@ -77,14 +83,45 @@ impl FileStorage {
             .create(true)
             .open(&wal_path)?;
 
-        let mut log = load_wal(&mut wal_file)?;
-        if let Some(snapshot) = &snapshot {
-            log[0].term = snapshot.metadata.last_included_term;
-        }
-        let compact_base_index = snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.metadata.last_included_index)
-            .unwrap_or(0);
+        let (mut log, wal_base_index) = load_wal(&mut wal_file)?;
+        let (compact_base_index, rewrite_wal) = match (&snapshot, wal_base_index) {
+            (Some(snapshot), Some(wal_base_index)) => {
+                let snapshot_index = snapshot.metadata.last_included_index;
+                if wal_base_index > snapshot_index {
+                    return Err(StorageError::Corruption(format!(
+                        "WAL base index {wal_base_index} is after snapshot index {snapshot_index}"
+                    )));
+                }
+                let covered_entries = snapshot_index - wal_base_index;
+                if covered_entries >= log.len() as u64 {
+                    log = vec![LogEntry {
+                        term: snapshot.metadata.last_included_term,
+                        command: Vec::new(),
+                    }];
+                } else {
+                    log.drain(0..covered_entries as usize);
+                    log[0] = LogEntry {
+                        term: snapshot.metadata.last_included_term,
+                        command: Vec::new(),
+                    };
+                }
+                (snapshot_index, wal_base_index != snapshot_index)
+            }
+            (Some(snapshot), None) => {
+                let snapshot_index = snapshot.metadata.last_included_index;
+                log[0].term = snapshot.metadata.last_included_term;
+                (snapshot_index, true)
+            }
+            (None, Some(wal_base_index)) => {
+                if wal_base_index != 0 {
+                    return Err(StorageError::Corruption(format!(
+                        "WAL base index {wal_base_index} requires a snapshot"
+                    )));
+                }
+                (0, false)
+            }
+            (None, None) => (0, true),
+        };
         let state = StorageState {
             hard_state,
             log,
@@ -94,14 +131,18 @@ impl FileStorage {
 
         wal_file.seek(SeekFrom::End(0))?;
 
-        Ok(Self {
+        let mut storage = Self {
             root_dir,
             hard_state_path,
             wal_file,
             snapshot_path,
             compact_base_index,
             state,
-        })
+        };
+        if rewrite_wal {
+            storage.rewrite_wal()?;
+        }
+        Ok(storage)
     }
 
     // 将一条 WAL 记录编码为 len + crc + payload 并追加到文件尾。
@@ -126,6 +167,10 @@ impl FileStorage {
         self.wal_file.set_len(0)?;
         self.wal_file.seek(SeekFrom::Start(0))?;
         self.wal_file.write_all(WAL_HEADER)?;
+        self.append_record(&WalRecord::SetBase {
+            index: self.compact_base_index,
+            term: self.state.log[0].term,
+        })?;
         let tail = if self.state.log.len() > 1 {
             self.state.log[1..].to_vec()
         } else {
@@ -264,11 +309,7 @@ impl Storage for FileStorage {
             )));
         }
         let local_index = last_included_index - self.compact_base_index;
-        compact_log_state(
-            &mut self.state.log,
-            local_index,
-            last_included_term,
-        )?;
+        compact_log_state(&mut self.state.log, local_index, last_included_term)?;
         self.compact_base_index = last_included_index;
         self.rewrite_wal()
     }
@@ -295,10 +336,11 @@ fn load_snapshot(path: &Path) -> StorageResult<Option<Snapshot>> {
     }
 }
 
-// 回放 WAL 得到日志镜像；仅允许截断文件尾部的半写记录。
+// 回放 WAL 得到日志镜像及其绝对基线；仅允许截断文件尾部的半写记录。
 // Replays WAL into a log mirror; only half-written tail records may be truncated.
-fn load_wal(file: &mut File) -> StorageResult<Vec<LogEntry>> {
+fn load_wal(file: &mut File) -> StorageResult<(Vec<LogEntry>, Option<u64>)> {
     let mut log = vec![sentinel_log_entry()];
+    let mut base_index = None;
     let file_len = file.metadata()?.len();
 
     if file_len == 0 {
@@ -307,7 +349,7 @@ fn load_wal(file: &mut File) -> StorageResult<Vec<LogEntry>> {
         file.write_all(WAL_HEADER)?;
         file.flush()?;
         file.sync_data()?;
-        return Ok(log);
+        return Ok((log, base_index));
     }
 
     if file_len < WAL_HEADER.len() as u64 {
@@ -318,7 +360,7 @@ fn load_wal(file: &mut File) -> StorageResult<Vec<LogEntry>> {
         file.write_all(WAL_HEADER)?;
         file.flush()?;
         file.sync_data()?;
-        return Ok(log);
+        return Ok((log, base_index));
     }
 
     file.seek(SeekFrom::Start(0))?;
@@ -373,12 +415,12 @@ fn load_wal(file: &mut File) -> StorageResult<Vec<LogEntry>> {
                 "invalid WAL record payload at offset {record_start}: {err}"
             ))
         })?;
-        apply_record(&mut log, record, record_start)?;
+        apply_record(&mut log, &mut base_index, record, record_start)?;
         valid_end = payload_end;
     }
 
     file.seek(SeekFrom::Start(valid_end))?;
-    Ok(log)
+    Ok((log, base_index))
 }
 
 // 尝试读满缓冲区；遇到 EOF 返回已读字节数，用于识别尾部半写。
@@ -398,8 +440,23 @@ fn read_some(file: &mut File, buf: &mut [u8]) -> StorageResult<usize> {
 
 // 将单条 WAL 记录应用到恢复中的日志，并校验记录不会破坏哨兵边界。
 // Applies one WAL record to the recovering log and validates sentinel-safe boundaries.
-fn apply_record(log: &mut Vec<LogEntry>, record: WalRecord, offset: u64) -> StorageResult<()> {
+fn apply_record(
+    log: &mut Vec<LogEntry>,
+    base_index: &mut Option<u64>,
+    record: WalRecord,
+    offset: u64,
+) -> StorageResult<()> {
     match record {
+        WalRecord::SetBase { index, term } => {
+            if log.len() != 1 || base_index.is_some() {
+                return Err(StorageError::Corruption(format!(
+                    "WAL base record is not the first record at offset {offset}"
+                )));
+            }
+            *base_index = Some(index);
+            log[0].term = term;
+            Ok(())
+        }
         WalRecord::Append(entries) => {
             log.extend(entries);
             Ok(())
@@ -421,28 +478,6 @@ fn apply_record(log: &mut Vec<LogEntry>, record: WalRecord, offset: u64) -> Stor
     }
 }
 
-// 标准 CRC32(IEEE) 实现；避免额外依赖，同时保持 WAL record 可校验。
-// Standard CRC32 (IEEE) implementation; avoids extra dependencies while keeping records verifiable.
-fn checksum(payload: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff_u32;
-    for byte in payload {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = 0_u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
-}
-
-fn node_storage_dir(root: &Path, node_id: NodeId) -> PathBuf {
-    root.join(format!("node-{:08x}", node_id_hash(node_id)))
-}
-
-fn node_id_hash(node_id: NodeId) -> u32 {
-    checksum(&node_id.to_le_bytes())
-}
-
 // 尽力同步目录元数据；不支持目录 fsync 的平台上静默退化。
 // Best-effort directory metadata sync; silently degrades on platforms without directory fsync.
 fn sync_dir_best_effort(path: &Path) {
@@ -454,7 +489,8 @@ fn sync_dir_best_effort(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Storage;
+    use crate::storage::utils::node_id_hash;
+    use crate::storage::{Storage, node_storage_dir};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -609,6 +645,63 @@ mod tests {
         let state = storage.load().expect("load");
         assert_eq!(state.snapshot, Some(snap));
         assert_eq!(state.log, vec![entry(2, b""), entry(3, b"three")]);
+    }
+
+    #[test]
+    fn reopen_recovers_snapshot_saved_before_wal_compaction() {
+        let dir = TempDir::new().expect("temp dir");
+        let snap = snapshot(2, 2, b"state");
+
+        {
+            let mut storage = open_storage(&dir).expect("open file storage");
+            storage
+                .append_entries(&[entry(1, b"one"), entry(2, b"two"), entry(3, b"three")])
+                .expect("append");
+            storage.sync().expect("sync WAL before simulated crash");
+            storage.save_snapshot(snap.clone()).expect("save snapshot");
+        }
+
+        let storage = open_storage(&dir).expect("reopen after simulated crash");
+        let state = storage.load().expect("load");
+        assert_eq!(state.snapshot, Some(snap));
+        assert_eq!(state.log, vec![entry(2, b""), entry(3, b"three")]);
+        drop(storage);
+
+        let storage = open_storage(&dir).expect("reopen repaired WAL");
+        assert_eq!(
+            storage.load().expect("load").log,
+            vec![entry(2, b""), entry(3, b"three")]
+        );
+    }
+
+    #[test]
+    fn reopen_recovers_later_snapshot_saved_before_wal_compaction() {
+        let dir = TempDir::new().expect("temp dir");
+
+        {
+            let mut storage = open_storage(&dir).expect("open file storage");
+            storage
+                .append_entries(&[
+                    entry(1, b"one"),
+                    entry(2, b"two"),
+                    entry(3, b"three"),
+                    entry(4, b"four"),
+                ])
+                .expect("append");
+            storage
+                .save_snapshot(snapshot(2, 2, b"state at two"))
+                .expect("save first snapshot");
+            storage.compact_log(2, 2).expect("compact first snapshot");
+            storage.sync().expect("sync first compaction");
+            storage
+                .save_snapshot(snapshot(3, 3, b"state at three"))
+                .expect("save second snapshot");
+        }
+
+        let storage = open_storage(&dir).expect("reopen after second simulated crash");
+        let state = storage.load().expect("load");
+        assert_eq!(state.snapshot, Some(snapshot(3, 3, b"state at three")));
+        assert_eq!(state.log, vec![entry(3, b""), entry(4, b"four")]);
     }
 
     #[test]

@@ -5,3 +5,4 @@ pub mod client;
 pub mod install_snapshot;
 pub mod request_vote;
 pub mod rpc;
+pub mod server;

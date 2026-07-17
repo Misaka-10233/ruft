@@ -1,11 +1,13 @@
 use futures::{StreamExt, future};
+use ruft::result::AppendResult;
 use ruft::rpc::client::{NodeId, RuftClient};
 use ruft::rpc::rpc::{Rpc, RpcClient};
 use ruft::ruft::{ApplyMsg, Role, Ruft, RuftHandle};
+use ruft::storage;
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tarpc::client;
 use tarpc::serde_transport::tcp;
 use tarpc::server::{BaseChannel, incoming::Incoming};
@@ -13,11 +15,10 @@ use tarpc::tokio_serde::formats::Bincode;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep, timeout};
-
 struct TestNode {
     id: NodeId,
     handle: RuftHandle,
-    apply: mpsc::UnboundedReceiver<ApplyMsg>,
+    apply: mpsc::Receiver<ApplyMsg>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -58,14 +59,18 @@ async fn start_cluster_with(members: Vec<NodeId>, persistent: bool) -> Vec<TestN
             RuftClient::new(id, clients),
             members.clone(),
             persistent,
+            PathBuf::from("raft-data"),
             80,
             180,
+            1024,
+            1024,
         )
         .expect("load memory-backed node");
         let server = ruft.server();
         let handle = ruft.handle();
-        let apply = ruft.take_apply();
-
+        let applied = ruft
+            .take_applied_receiver()
+            .expect("applied receiver has already been taken");
         let server_task = tokio::spawn(
             listener
                 .filter_map(|transport| future::ready(transport.ok()))
@@ -82,7 +87,7 @@ async fn start_cluster_with(members: Vec<NodeId>, persistent: bool) -> Vec<TestN
         nodes.push(TestNode {
             id,
             handle,
-            apply,
+            apply: applied,
             tasks: vec![server_task, run_task],
         });
     }
@@ -189,13 +194,9 @@ async fn recv_applied(node: &mut TestNode) -> Vec<u8> {
     }
 }
 
-fn default_storage_dir(node_id: NodeId) -> PathBuf {
-    PathBuf::from("ruft-data").join(format!("node-{node_id}"))
-}
-
 fn clean_storage_dirs(node_ids: &[NodeId]) {
     for node_id in node_ids {
-        let _ = fs::remove_dir_all(default_storage_dir(*node_id));
+        let _ = fs::remove_dir_all(storage::node_storage_dir(Path::new("raft-data"), *node_id));
     }
 }
 
@@ -209,13 +210,14 @@ async fn three_tcp_nodes_elect_one_leader_and_replicate_log() {
         .find(|node| node.id == leader_id)
         .expect("leader node");
 
+    let append_result = leader
+        .handle
+        .append_log(b"set x=1".to_vec())
+        .await
+        .expect("append reply");
     assert!(
-        leader
-            .handle
-            .append_log(b"set x=1".to_vec())
-            .await
-            .expect("append reply"),
-        "leader should accept client log"
+        matches!(append_result, AppendResult::Accepted { index: 1, term } if term > 0),
+        "leader should accept the first client log: {append_result:?}"
     );
 
     wait_for_commit(&nodes, 1).await;
@@ -238,12 +240,13 @@ async fn follower_rejects_client_append() {
         .find(|node| node.id != leader_id)
         .expect("follower node");
 
-    assert!(
-        !follower
+    assert_eq!(
+        follower
             .handle
             .append_log(b"should not append".to_vec())
             .await
             .expect("append reply"),
+        AppendResult::NotLeader,
         "follower should reject client log"
     );
 
@@ -265,15 +268,20 @@ async fn leader_replicates_multiple_logs_in_order() {
     let leader = node_by_id(&nodes, leader_id);
     let commands = vec![b"set x=1".to_vec(), b"set y=2".to_vec(), b"commit".to_vec()];
 
-    for command in &commands {
-        assert!(
-            leader
-                .handle
-                .append_log(command.clone())
-                .await
-                .expect("append reply"),
-            "leader should accept client log"
-        );
+    let mut leader_term = None;
+    for (offset, command) in commands.iter().enumerate() {
+        let append_result = leader
+            .handle
+            .append_log(command.clone())
+            .await
+            .expect("append reply");
+        match append_result {
+            AppendResult::Accepted { index, term } => {
+                assert_eq!(index, offset as u64 + 1, "accepted log index");
+                assert_eq!(leader_term.get_or_insert(term), &term, "leader term");
+            }
+            result => panic!("leader should accept client log: {result:?}"),
+        }
     }
 
     wait_for_commit(&nodes, commands.len() as u64).await;
@@ -304,13 +312,14 @@ async fn cluster_elects_new_leader_after_current_leader_stops() {
     let new_leader_id = wait_for_leader_among(&nodes, &active_ids).await;
     let new_leader = node_by_id(&nodes, new_leader_id);
 
+    let append_result = new_leader
+        .handle
+        .append_log(b"after failover".to_vec())
+        .await
+        .expect("append reply");
     assert!(
-        new_leader
-            .handle
-            .append_log(b"after failover".to_vec())
-            .await
-            .expect("append reply"),
-        "new leader should accept client log"
+        matches!(append_result, AppendResult::Accepted { index: 1, term } if term > 0),
+        "new leader should accept the first client log: {append_result:?}"
     );
 
     wait_for_commit_among(&nodes, &active_ids, 1).await;
@@ -338,13 +347,14 @@ async fn persistent_node_restores_state_after_restart() {
     let leader_id = wait_for_leader(&nodes).await;
     let leader = node_by_id(&nodes, leader_id);
 
+    let append_result = leader
+        .handle
+        .append_log(b"durable entry".to_vec())
+        .await
+        .expect("append reply");
     assert!(
-        leader
-            .handle
-            .append_log(b"durable entry".to_vec())
-            .await
-            .expect("append reply"),
-        "leader should accept durable log"
+        matches!(append_result, AppendResult::Accepted { index: 1, term } if term > 0),
+        "leader should accept the first client log: {append_result:?}"
     );
     wait_for_commit(&nodes, 1).await;
 
@@ -357,8 +367,11 @@ async fn persistent_node_restores_state_after_restart() {
         RuftClient::new(leader_id, HashMap::new()),
         node_ids.clone(),
         true,
+        PathBuf::from("raft-data"),
         80,
         180,
+        1024,
+        1024,
     )
     .expect("restore persistent node");
     let restored_snapshot = restored.get_info();

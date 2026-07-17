@@ -1,5 +1,6 @@
 mod file;
 mod memory;
+mod utils;
 
 use crate::rpc::client::NodeId;
 use crate::ruft::{LogEntry, Snapshot};
@@ -9,6 +10,7 @@ use std::fmt::{Display, Formatter};
 pub use file::FileStorage;
 pub use memory::MemoryStorage;
 use serde::{Deserialize, Serialize};
+pub use utils::{checksum, node_storage_dir};
 
 // 存储层统一结果类型，便于后续文件 WAL 和快照实现复用。
 // Shared storage result type, reusable by future file WAL and snapshot backends.

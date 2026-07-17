@@ -1,3 +1,4 @@
+use crate::result::AppendResult;
 use crate::rpc::append_entries::{AppendEntriesArgs, AppendEntriesReply};
 use crate::rpc::install_snapshot::{InstallSnapshotArgs, InstallSnapshotReply};
 use crate::rpc::request_vote::{RequestVoteArgs, RequestVoteReply};
@@ -39,7 +40,7 @@ pub enum Event {
     InstallSnapshotReply(InstallSnapshotReply),
     // 客户端提交的新命令，只有 Leader 会追加到日志。
     // New client command; only the leader appends it to the log.
-    NewLogEntries(Vec<u8>, oneshot::Sender<bool>),
+    NewLogEntries(Vec<u8>, oneshot::Sender<AppendResult>),
     // 上层状态机提交快照数据，请求 Raft 压缩已经应用的日志前缀。
     // Upper state machine submits snapshot data to compact an applied log prefix.
     CreateSnapshot(u64, Vec<u8>, oneshot::Sender<bool>),

@@ -12,3 +12,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 tarpc = { version = "0.37", features = ["full"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-serde = "0.9.0"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+
+[[bench]]
+name = "kvserver"
+harness = false

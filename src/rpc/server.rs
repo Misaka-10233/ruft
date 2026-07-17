@@ -107,7 +107,11 @@ impl Rpc for RuftServer {
         args: InstallSnapshotArgs,
     ) -> InstallSnapshotReply {
         let (tx, rx) = oneshot::channel();
-        if let Err(err) = self.event_sender.send(Event::InstallSnapshot(args, tx)).await {
+        if let Err(err) = self
+            .event_sender
+            .send(Event::InstallSnapshot(args, tx))
+            .await
+        {
             error!("Error sending InstallSnapshot event: {err}");
             return self.install_snapshot_error();
         }

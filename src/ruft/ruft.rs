@@ -6,12 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::events::event::Event::{self, VoteResult};
+use crate::result::AppendResult;
 use crate::rpc::append_entries::{AppendEntriesArgs, AppendEntriesReply};
 use crate::rpc::client::{NodeId, RuftClient};
 use crate::rpc::install_snapshot::{InstallSnapshotArgs, InstallSnapshotReply};
 use crate::rpc::request_vote::{RequestVoteArgs, RequestVoteReply};
+use crate::rpc::server::RuftServer;
 use crate::ruft::role::Role::{self};
-use crate::ruft::server::RuftServer;
 use crate::storage::{FileStorage, HardState, MemoryStorage, Storage, StorageResult};
 use crate::utilis::timer::Timer;
 use log::{error, warn};
@@ -67,8 +68,8 @@ pub struct Ruft {
 
     // Apply 管道：把已提交日志交给调用方状态机。
     // Apply channel: exposes committed log entries to the caller's state machine.
-    apply_sender: mpsc::UnboundedSender<ApplyMsg>,
-    pub apply: mpsc::UnboundedReceiver<ApplyMsg>, // 暴露给调用者的 Apply Receiver。Receiver exposed to callers.
+    apply_sender: mpsc::Sender<ApplyMsg>,
+    applied_receiver: Option<mpsc::Receiver<ApplyMsg>>, // 暴露给调用者的 Apply Receiver。Receiver exposed to callers.
 }
 
 // Raft 日志条目：记录产生该命令的任期和要应用到状态机的命令字节。
@@ -83,8 +84,15 @@ pub struct LogEntry {
 // Apply message: separates normal log commands from snapshot installation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApplyMsg {
-    Command { index: u64, data: Vec<u8> },
-    Snapshot { index: u64, term: u64, data: Vec<u8> },
+    Command {
+        index: u64,
+        data: Vec<u8>,
+    },
+    Snapshot {
+        index: u64,
+        term: u64,
+        data: Vec<u8>,
+    },
 }
 
 // 可克隆的运行时句柄：节点进入 run 后，调用方仍可提交日志和读取信息。
@@ -127,11 +135,14 @@ impl Ruft {
         rpc_client: RuftClient,
         members: Vec<NodeId>,
         persistent: bool,
+        storage_root_dir: PathBuf,
         election_timeout_lower_bound_ms: u32,
         election_timeout_upper_bound_ms: u32,
+        event_buffer_size: usize,
+        applied_buffer_size: usize,
     ) -> StorageResult<Self> {
         let storage: Box<dyn Storage> = if persistent {
-            Box::new(FileStorage::open(Self::default_storage_dir(), node_id)?)
+            Box::new(FileStorage::open(storage_root_dir, node_id)?)
         } else {
             Box::new(MemoryStorage::new())
         };
@@ -143,11 +154,9 @@ impl Ruft {
             storage,
             election_timeout_lower_bound_ms,
             election_timeout_upper_bound_ms,
+            event_buffer_size,
+            applied_buffer_size,
         )
-    }
-
-    fn default_storage_dir() -> PathBuf {
-        PathBuf::from("ruft-data")
     }
 
     // 从已选定的存储层恢复节点状态；日志从哨兵项开始，便于使用 1-based Raft 索引。
@@ -159,9 +168,11 @@ impl Ruft {
         storage: Box<dyn Storage>,
         election_timeout_lower_bound_ms: u32,
         election_timeout_upper_bound_ms: u32,
+        event_buffer_size: usize,
+        applied_buffer_size: usize,
     ) -> StorageResult<Self> {
-        let (event_sender, event_receiver) = mpsc::channel::<Event>(1024);
-        let (apply_sender, apply) = mpsc::unbounded_channel::<ApplyMsg>();
+        let (event_sender, event_receiver) = mpsc::channel::<Event>(event_buffer_size);
+        let (apply_sender, _applied_receiver) = mpsc::channel::<ApplyMsg>(applied_buffer_size);
         let storage_state = storage.load()?;
         let snapshot_index = storage_state
             .snapshot
@@ -209,13 +220,13 @@ impl Ruft {
                 election_timeout_upper_bound_ms,
             ),
             apply_sender,
-            apply,
+            applied_receiver: Some(_applied_receiver),
         })
     }
 
     // 主事件循环：把计时器 tick 和内部事件统一调度到状态机处理。
     // Main event loop: routes timer ticks and internal events into the state machine.
-    pub async fn run(&mut self) {
+    pub async fn run(mut self) {
         let heartbeat_sender = self.event_sender.clone();
         // 独立心跳节拍；非 Leader 收到 Heartbeat 事件后会直接忽略。
         // Independent heartbeat ticker; non-leaders ignore Heartbeat events.
@@ -259,7 +270,7 @@ impl Ruft {
     pub async fn append_log(
         &self,
         command: Vec<u8>,
-    ) -> Result<bool, tokio::sync::oneshot::error::RecvError> {
+    ) -> Result<AppendResult, tokio::sync::oneshot::error::RecvError> {
         self.handle().append_log(command).await
     }
 
@@ -269,13 +280,6 @@ impl Ruft {
         RuftHandle {
             event_sender: self.event_sender.clone(),
         }
-    }
-
-    // 取走 apply 接收端，便于调用方把节点移动到 run 任务前保留应用输出。
-    // Takes the apply receiver so callers can keep it before moving the node into run.
-    pub fn take_apply(&mut self) -> mpsc::UnboundedReceiver<ApplyMsg> {
-        let (_sender, receiver) = mpsc::unbounded_channel();
-        std::mem::replace(&mut self.apply, receiver)
     }
 
     // 返回当前节点信息；该方法在事件循环内调用时是串行一致的。
@@ -290,6 +294,10 @@ impl Ruft {
             log_len: self.log.len(),
             snapshot_index: self.snapshot_index,
         }
+    }
+
+    pub fn take_applied_receiver(&mut self) -> Option<mpsc::Receiver<ApplyMsg>> {
+        self.applied_receiver.take()
     }
 
     // 创建网络服务句柄；tarpc server 应持有该轻量句柄，而不是直接持有 Ruft 状态机。
@@ -328,7 +336,7 @@ impl Ruft {
             }
             Event::ElectionTimeout => {
                 if self.role != Role::Leader {
-                    self._become_candidate();
+                    self._become_candidate().await;
                 }
             }
 
@@ -498,8 +506,7 @@ impl Ruft {
         entries: &[LogEntry],
     ) -> StorageResult<()> {
         let local_index = first_index_to_remove - self.snapshot_index;
-        self.storage
-            .replace_suffix(local_index, entries)?;
+        self.storage.replace_suffix(local_index, entries)?;
         self.storage.sync()
     }
 
@@ -517,7 +524,10 @@ impl Ruft {
     }
 
     fn last_log_term(&self) -> u64 {
-        self.log.last().map(|entry| entry.term).unwrap_or(self.snapshot_term)
+        self.log
+            .last()
+            .map(|entry| entry.term)
+            .unwrap_or(self.snapshot_term)
     }
 
     fn offset(&self, index: u64) -> Option<usize> {
@@ -641,10 +651,10 @@ impl Ruft {
         if args.leader_commit > self.commit_index {
             let last_new_index = self.last_log_index();
             self.commit_index = min(args.leader_commit, last_new_index);
-            self._apply_committed();
+            self._apply_committed().await;
         }
         reply.success = true;
-        reply.match_index = self.last_log_index();
+        reply.match_index = args.prev_log_index + args.entries.len() as u64;
         reply
     }
 
@@ -705,11 +715,11 @@ impl Ruft {
 
     // 处理客户端新日志；Leader 先追加本地日志，再等待多数派复制后提交。
     // Handles a new client log; this implementation accepts it only on the leader.
-    fn _on_append_log(&mut self, log: Vec<u8>) -> bool {
+    fn _on_append_log(&mut self, log: Vec<u8>) -> AppendResult {
         // 非 Leader 不能直接接收写入。
         // Non-leaders do not accept writes directly.
         if self.role != Role::Leader {
-            return false;
+            return AppendResult::NotLeader;
         }
 
         // 新日志使用当前 Leader 任期。
@@ -720,14 +730,17 @@ impl Ruft {
         };
         if let Err(err) = self.append_persistent_entries(std::slice::from_ref(&entry)) {
             error!("Error persisting leader log entry: {err}");
-            return false;
+            return AppendResult::PersistentError;
         }
         self.log.push(entry);
 
         // 立刻广播，减少客户端命令等待下一次心跳的延迟。
         // Broadcast immediately so client commands need not wait for the next heartbeat.
         self._boardcast_append_entries();
-        true
+        AppendResult::Accepted {
+            index: self.last_log_index(),
+            term: self.current_term,
+        }
     }
 
     fn _on_create_snapshot(&mut self, index: u64, data: Vec<u8>) -> bool {
@@ -805,11 +818,15 @@ impl Ruft {
         self.snapshot_data = Some(args.data.clone());
         self.commit_index = self.commit_index.max(args.last_included_index);
         self.last_applied = self.last_applied.max(args.last_included_index);
-        if let Err(err) = self.apply_sender.send(ApplyMsg::Snapshot {
-            index: args.last_included_index,
-            term: args.last_included_term,
-            data: args.data,
-        }) {
+        if let Err(err) = self
+            .apply_sender
+            .send(ApplyMsg::Snapshot {
+                index: args.last_included_index,
+                term: args.last_included_term,
+                data: args.data,
+            })
+            .await
+        {
             error!("Error sending snapshot Apply message: {err}");
         }
 
@@ -821,7 +838,7 @@ impl Ruft {
 
     // 选举超时后成为 Candidate：增加任期、投给自己，并向其他节点拉票。
     // On election timeout, become candidate: bump term, vote for self, and request votes.
-    fn _become_candidate(&mut self) {
+    async fn _become_candidate(&mut self) {
         // 开始新一轮选举前重置超时，避免马上再次触发。
         // Reset timeout before starting the new election round.
         self.election_timer.reset();
@@ -834,11 +851,18 @@ impl Ruft {
         self.role = Role::Candidate;
         self.current_term = cur_term;
 
-        let majority = self.members.len() / 2 + 1;
-
         // Candidate 自动投给自己。
         // Candidate votes for itself.
         self.voted_for = Some(self.node_id);
+
+        if self.members.len() == 1 {
+            if let Err(err) = self.event_sender.send(VoteResult(true, cur_term)).await {
+                error!("Error sending VoteResult event: {err}");
+            }
+            return;
+        }
+
+        let majority = self.members.len() / 2 + 1;
 
         let args = RequestVoteArgs {
             term: cur_term,
@@ -903,9 +927,7 @@ impl Ruft {
         // New leader assumes each follower's next entry starts after the local log tail.
         self.role = Role::Leader;
         let next = self.last_log_index() + 1;
-        self.next_index
-            .iter_mut()
-            .for_each(|x| *x.1 = next);
+        self.next_index.iter_mut().for_each(|x| *x.1 = next);
         self.match_index.iter_mut().for_each(|x| *x.1 = 0);
         self._boardcast_append_entries();
     }
@@ -948,13 +970,14 @@ impl Ruft {
         if reply.success {
             // 按 Follower 返回的匹配索引推进复制进度。
             // Advance replication progress using the follower's returned match index.
-            *self.match_index.get_mut(&reply.node_id).unwrap() = reply.match_index;
-            *self.next_index.get_mut(&reply.node_id).unwrap() = reply.match_index + 1;
+            let match_index = reply.match_index.min(self.last_log_index());
+            *self.match_index.get_mut(&reply.node_id).unwrap() = match_index;
+            *self.next_index.get_mut(&reply.node_id).unwrap() = match_index + 1;
 
             // Leader 只能提交当前任期内、已复制到多数派的日志。
             // Leaders may commit only current-term entries replicated on a majority.
             self._advance_commit_index();
-            self._apply_committed();
+            self._apply_committed().await;
         } else {
             // 复制失败通常表示 prev_log 不匹配，回退 next_index 后下次重试。
             // Failure usually means prev_log mismatch; decrement next_index and retry later.
@@ -1012,7 +1035,7 @@ impl Ruft {
 
     // 按日志顺序应用已提交日志，保证状态机观察到的命令顺序和提交顺序一致。
     // Applies committed entries in log order so the state machine observes commit order.
-    fn _apply_committed(&mut self) {
+    async fn _apply_committed(&mut self) {
         while self.commit_index > self.last_applied {
             self.last_applied += 1;
             let Some(entry) = self.entry_at(self.last_applied) else {
@@ -1024,6 +1047,7 @@ impl Ruft {
                     index: self.last_applied,
                     data: entry.command.clone(),
                 })
+                .await
             {
                 Ok(_) => {}
                 Err(err) => {
@@ -1069,7 +1093,7 @@ impl Ruft {
     // 处理投票汇总结果：多数票晋升，更高任期或失败则退回 Follower。
     // Handles aggregated vote results: majority promotes, higher term/failure steps down.
     async fn _on_vote_result(&self, success: bool, new_term: u64) {
-        if self.role != Role::Candidate {
+        if self.role != Role::Candidate || new_term != self.current_term {
             return;
         }
         if success {
@@ -1094,7 +1118,7 @@ impl RuftHandle {
     pub async fn append_log(
         &self,
         command: Vec<u8>,
-    ) -> Result<bool, tokio::sync::oneshot::error::RecvError> {
+    ) -> Result<AppendResult, tokio::sync::oneshot::error::RecvError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .event_sender
@@ -1189,8 +1213,11 @@ mod tests {
             RuftClient::new(node_id, HashMap::new()),
             members,
             false,
+            PathBuf::from("raft-data"),
             150,
             300,
+            1024,
+            1024,
         )
         .expect("load memory-backed node")
     }
@@ -1214,6 +1241,8 @@ mod tests {
             Box::new(storage),
             150,
             300,
+            1024,
+            1024,
         )
         .expect("load test storage")
     }
@@ -1230,6 +1259,8 @@ mod tests {
             Box::new(storage),
             150,
             300,
+            1024,
+            1024,
         )
         .expect("load file storage")
     }
@@ -1241,8 +1272,11 @@ mod tests {
             RuftClient::new(1, HashMap::new()),
             vec![1, 2, 3],
             false,
+            PathBuf::from("raft-data"),
             150,
             300,
+            1024,
+            1024,
         )
         .expect("load memory-backed node");
 
@@ -1287,7 +1321,7 @@ mod tests {
     #[tokio::test]
     async fn new_with_persistent_flag_restores_from_default_storage_dir() {
         let node_id = 10_001;
-        let storage_dir = Ruft::default_storage_dir();
+        let storage_dir = PathBuf::from("raft-data");
         let _ = fs::remove_dir_all(&storage_dir);
 
         {
@@ -1310,8 +1344,11 @@ mod tests {
             RuftClient::new(node_id, HashMap::new()),
             vec![node_id, 2],
             true,
+            PathBuf::from("raft-data"),
             150,
             300,
+            1024,
+            1024,
         )
         .expect("load persistent node from default dir");
 
@@ -1364,7 +1401,10 @@ mod tests {
         let mut node = test_node_with_storage(1, vec![1, 2, 3], storage);
         node.role = Role::Leader;
 
-        assert!(node._on_append_log(b"entry".to_vec()));
+        assert_eq!(
+            node._on_append_log(b"entry".to_vec()),
+            AppendResult::Accepted { index: 1, term: 1 }
+        );
 
         let persisted = node.storage.load().expect("load storage");
         assert_eq!(persisted.log, vec![entry(0, b""), entry(1, b"entry")]);
@@ -1379,7 +1419,10 @@ mod tests {
         node.current_term = 1;
         node.role = Role::Leader;
 
-        assert!(node._on_append_log(b"entry".to_vec()));
+        assert_eq!(
+            node._on_append_log(b"entry".to_vec()),
+            AppendResult::Accepted { index: 1, term: 1 }
+        );
         drop(node);
 
         let storage = FileStorage::open(dir.path(), 1).expect("reopen file storage");
@@ -1480,7 +1523,7 @@ mod tests {
     async fn candidate_self_vote_is_persisted() {
         let mut node = new_test_node(1, vec![1]);
 
-        node._become_candidate();
+        node._become_candidate().await;
 
         let persisted = node.storage.load().expect("load storage");
         assert_eq!(persisted.hard_state.current_term, 1);
@@ -1602,7 +1645,7 @@ mod tests {
     async fn election_timeout_moves_follower_to_candidate_and_votes_for_self() {
         let mut node = new_test_node(1, vec![1]);
 
-        node._become_candidate();
+        node._become_candidate().await;
 
         assert_eq!(node.role, Role::Candidate);
         assert_eq!(node.current_term, 1);
@@ -1770,7 +1813,6 @@ mod tests {
     #[tokio::test]
     async fn install_snapshot_compacts_log_and_emits_apply_snapshot() {
         let mut node = new_test_node(1, vec![1, 2, 3]);
-        let mut apply = node.take_apply();
         node.log = vec![entry(0, b""), entry(1, b"one")];
 
         let reply = node
@@ -1790,7 +1832,10 @@ mod tests {
         assert_eq!(node.last_applied, 5);
         assert_eq!(node.log, vec![entry(4, b"")]);
         assert_eq!(
-            apply.try_recv().expect("snapshot apply"),
+            node.applied_receiver
+                .unwrap()
+                .try_recv()
+                .expect("snapshot apply"),
             ApplyMsg::Snapshot {
                 index: 5,
                 term: 4,
