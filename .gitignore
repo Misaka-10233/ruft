@@ -24,3 +24,6 @@ rustc-ice-*.txt
 #.idea/
 
 raft-data
+.agents
+report
+docs

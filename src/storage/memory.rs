@@ -5,18 +5,15 @@ use crate::storage::{
 };
 
 // 内存存储实现：主要用于测试和默认无持久化场景。
-// In-memory storage backend: mainly for tests and default non-durable use.
 #[derive(Clone, Debug)]
 pub struct MemoryStorage {
     // 当前持久状态的内存副本。
-    // In-memory copy of the persistent state.
     state: StorageState,
     compact_base_index: u64,
 }
 
 impl MemoryStorage {
     // 创建空存储，包含默认 hard state 和 log[0] 哨兵项。
-    // Creates empty storage with default hard state and the log[0] sentinel.
     pub fn new() -> Self {
         Self {
             state: StorageState {
@@ -29,7 +26,6 @@ impl MemoryStorage {
     }
 
     // 用指定状态创建内存存储；恢复路径测试可用它注入已有日志。
-    // Creates storage from a supplied state; useful for recovery-path tests.
     pub fn with_state(state: StorageState) -> StorageResult<Self> {
         validate_sentinel_log(&state.log)?;
         let compact_base_index = state
@@ -52,27 +48,23 @@ impl Default for MemoryStorage {
 
 impl Storage for MemoryStorage {
     // 返回状态副本，避免调用方绕过 Storage trait 修改内部状态。
-    // Returns a copy so callers cannot mutate internal state outside the trait.
     fn load(&self) -> StorageResult<StorageState> {
         Ok(self.state.clone())
     }
 
     // 覆盖 hard state；内存实现不需要额外刷盘。
-    // Replaces hard state; memory storage needs no extra flush.
     fn save_hard_state(&mut self, hard_state: HardState) -> StorageResult<()> {
         self.state.hard_state = hard_state;
         Ok(())
     }
 
     // 顺序追加日志；空切片自然是 no-op。
-    // Appends entries in order; an empty slice is naturally a no-op.
     fn append_entries(&mut self, entries: &[LogEntry]) -> StorageResult<()> {
         self.state.log.extend_from_slice(entries);
         Ok(())
     }
 
     // 截断日志后缀，但永远保留 log[0] 哨兵项。
-    // Truncates the log suffix while always preserving the log[0] sentinel.
     fn truncate_suffix(&mut self, first_index_to_remove: u64) -> StorageResult<()> {
         let len = self.state.log.len() as u64;
         if first_index_to_remove == 0 {
@@ -91,7 +83,6 @@ impl Storage for MemoryStorage {
     }
 
     // 先校验边界，再一次性替换后缀；内存实现不会发生中途 IO 失败。
-    // Validates bounds before replacing the suffix; memory cannot fail midway on IO.
     fn replace_suffix(
         &mut self,
         first_index_to_remove: u64,
@@ -115,7 +106,6 @@ impl Storage for MemoryStorage {
     }
 
     // 内存存储没有刷盘动作，保留接口以匹配持久化后端语义。
-    // Memory storage has nothing to flush; this preserves durable-backend semantics.
     fn sync(&mut self) -> StorageResult<()> {
         Ok(())
     }
@@ -148,6 +138,7 @@ pub(crate) fn compact_log_state(
     local_included_index: u64,
     last_included_term: u64,
 ) -> StorageResult<()> {
+    // 将快照边界改为新的哨兵项，并保留尚未包含在快照中的后缀。
     let len = log.len() as u64;
     let mut compacted = vec![LogEntry {
         term: last_included_term,

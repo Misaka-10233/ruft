@@ -13,7 +13,6 @@ use crate::storage::{
 };
 
 // WAL 文件头包含 magic 和版本号；后续扩展格式时应新版本化而不是静默兼容。
-// WAL header contains magic and version; future format changes should version this explicitly.
 const WAL_HEADER: &[u8; 7] = b"RUFTWAL";
 const WAL_FILE_NAME: &str = "node.wal";
 const HARD_STATE_FILE_NAME: &str = "hard_state";
@@ -22,20 +21,16 @@ const SNAPSHOT_FILE_PATH: &str = "snapshot";
 const SNAPSHOT_TMP_FILE_PATH: &str = "snapshot.tmp";
 
 // WAL 只记录会改变日志镜像的操作；恢复时按顺序回放即可得到完整 log。
-// WAL records only log-mutating operations; replaying them in order reconstructs the log.
 #[derive(Debug, Serialize, Deserialize)]
 enum WalRecord {
     // 顺序追加一批日志条目。
-    // Appends a batch of log entries in order.
     Append(Vec<LogEntry>),
     // 原子替换后缀：先截断到指定索引，再追加新的后缀条目。
-    // Atomically replaces the suffix by truncating at the index, then appending entries.
     ReplaceSuffix {
         first_index_to_remove: u64,
         entries: Vec<LogEntry>,
     },
     // 声明后续记录相对于哪个绝对日志索引；压缩重写 WAL 时首先写入。
-    // Declares the absolute log index subsequent records are relative to.
     SetBase {
         index: u64,
         term: u64,
@@ -43,29 +38,23 @@ enum WalRecord {
 }
 
 // 文件存储实现：hard_state 使用原子替换，log 使用单段 WAL 记录追加。
-// File storage backend: hard_state is atomically replaced, log uses a single WAL segment.
 #[derive(Debug)]
 pub struct FileStorage {
     // 节点持久化目录；hard_state 和 wal/ 都位于此目录下。
-    // Persistent directory for this node; hard_state and wal/ live under it.
     root_dir: PathBuf,
     // hard_state 文件路径，保存 current_term 和 voted_for。
-    // Path to the hard_state file storing current_term and voted_for.
     hard_state_path: PathBuf,
     // 当前单段 WAL 文件句柄；追加记录和 sync 都复用它。
-    // Handle to the current single-segment WAL file, reused for appends and sync.
     wal_file: File,
 
     snapshot_path: PathBuf,
     compact_base_index: u64,
     // 从磁盘恢复后维护的内存镜像，避免每次 load 都重新回放 WAL。
-    // In-memory mirror restored from disk, avoiding WAL replay on every load.
     state: StorageState,
 }
 
 impl FileStorage {
     // 打开或创建持久化存储，并从 hard_state + WAL 恢复完整持久状态。
-    // Opens or creates persistent storage, then restores state from hard_state + WAL.
     pub fn open(root: impl AsRef<Path>, node_id: NodeId) -> StorageResult<Self> {
         let root_dir = utils::node_storage_dir(root.as_ref(), node_id);
         let wal_dir = root_dir.join("wal");
@@ -146,7 +135,6 @@ impl FileStorage {
     }
 
     // 将一条 WAL 记录编码为 len + crc + payload 并追加到文件尾。
-    // Encodes one WAL record as len + crc + payload and appends it to the file tail.
     fn append_record(&mut self, record: &WalRecord) -> StorageResult<()> {
         let payload = bincode::serialize(record).map_err(|err| {
             StorageError::InvalidOperation(format!("serialize WAL record: {err}"))
@@ -185,7 +173,6 @@ impl FileStorage {
     }
 
     // 校验后缀替换边界，永远不允许删除 log[0] 哨兵项。
-    // Validates suffix replacement bounds and never allows deleting the log[0] sentinel.
     fn validate_suffix_index(
         &self,
         operation: &str,
@@ -208,13 +195,11 @@ impl FileStorage {
 
 impl Storage for FileStorage {
     // 返回已恢复并随写入同步维护的状态副本。
-    // Returns a copy of the restored state mirror kept up to date with writes.
     fn load(&self) -> StorageResult<StorageState> {
         Ok(self.state.clone())
     }
 
     // 通过 tmp + fsync + rename 原子保存 hard state，避免崩溃留下半写文件。
-    // Saves hard state atomically with tmp + fsync + rename to avoid half-written files.
     fn save_hard_state(&mut self, hard_state: HardState) -> StorageResult<()> {
         let tmp_path = self.root_dir.join(HARD_STATE_TMP_FILE_NAME);
         let encoded = bincode::serialize(&hard_state).map_err(|err| {
@@ -229,15 +214,13 @@ impl Storage for FileStorage {
         }
 
         fs::rename(&tmp_path, &self.hard_state_path)?;
-        // Windows 对目录 fsync 支持有限；这里 best-effort 固化 rename 元数据。
-        // Directory fsync support is limited on Windows; this best-effort call hardens rename metadata.
+        // Windows 对目录 fsync 支持有限；这里尽力固化 rename 元数据。
         sync_dir_best_effort(&self.root_dir);
         self.state.hard_state = hard_state;
         Ok(())
     }
 
     // 先写 WAL 记录，再更新内存镜像；调用方随后通过 sync() 定义刷盘边界。
-    // Writes the WAL record before updating the memory mirror; callers define durability via sync().
     fn append_entries(&mut self, entries: &[LogEntry]) -> StorageResult<()> {
         if entries.is_empty() {
             return Ok(());
@@ -249,13 +232,11 @@ impl Storage for FileStorage {
     }
 
     // 截断是空后缀替换的特例，共用同一条 WAL 记录格式。
-    // Truncation is a suffix replacement with no new entries, sharing the same WAL record format.
     fn truncate_suffix(&mut self, first_index_to_remove: u64) -> StorageResult<()> {
         self.replace_suffix(first_index_to_remove, &[])
     }
 
     // 使用单条 ReplaceSuffix 记录表达截断+追加，避免恢复时看到半个逻辑更新。
-    // Uses one ReplaceSuffix record for truncate+append so recovery never observes a half update.
     fn replace_suffix(
         &mut self,
         first_index_to_remove: u64,
@@ -273,7 +254,6 @@ impl Storage for FileStorage {
     }
 
     // 刷新 WAL 文件内容；hard_state 在 save_hard_state 内部已经单独 fsync。
-    // Flushes WAL contents; hard_state is fsynced inside save_hard_state separately.
     fn sync(&mut self) -> StorageResult<()> {
         self.wal_file.flush()?;
         self.wal_file.sync_data()?;
@@ -316,7 +296,6 @@ impl Storage for FileStorage {
 }
 
 // 读取 hard_state；缺失表示首次启动，损坏则拒绝启动。
-// Loads hard_state; absence means first boot, corruption refuses startup.
 fn load_hard_state(path: &Path) -> StorageResult<HardState> {
     match fs::read(path) {
         Ok(bytes) => bincode::deserialize(&bytes)
@@ -337,7 +316,6 @@ fn load_snapshot(path: &Path) -> StorageResult<Option<Snapshot>> {
 }
 
 // 回放 WAL 得到日志镜像及其绝对基线；仅允许截断文件尾部的半写记录。
-// Replays WAL into a log mirror; only half-written tail records may be truncated.
 fn load_wal(file: &mut File) -> StorageResult<(Vec<LogEntry>, Option<u64>)> {
     let mut log = vec![sentinel_log_entry()];
     let mut base_index = None;
@@ -345,7 +323,6 @@ fn load_wal(file: &mut File) -> StorageResult<(Vec<LogEntry>, Option<u64>)> {
 
     if file_len == 0 {
         // 新 WAL 初始化文件头并立即刷盘，保证下次启动能识别格式。
-        // A new WAL writes and syncs the header so the next startup can identify the format.
         file.write_all(WAL_HEADER)?;
         file.flush()?;
         file.sync_data()?;
@@ -354,7 +331,6 @@ fn load_wal(file: &mut File) -> StorageResult<(Vec<LogEntry>, Option<u64>)> {
 
     if file_len < WAL_HEADER.len() as u64 {
         // 只有文件尾部损坏到不足 header 时才重建；此时没有完整 record 可保留。
-        // Rebuild only when the file is shorter than the header; no complete record can exist.
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(WAL_HEADER)?;
@@ -384,7 +360,6 @@ fn load_wal(file: &mut File) -> StorageResult<(Vec<LogEntry>, Option<u64>)> {
         }
         if header_bytes < record_header.len() {
             // record 头部半写说明崩溃发生在文件尾部，截断到上一个有效位置。
-            // A partial record header means a tail crash write; truncate to the previous valid end.
             file.set_len(valid_end)?;
             break;
         }
@@ -395,7 +370,6 @@ fn load_wal(file: &mut File) -> StorageResult<(Vec<LogEntry>, Option<u64>)> {
         let payload_end = payload_start + payload_len as u64;
         if payload_end > file_len {
             // payload 半写同样只允许出现在尾部，截断后保留所有完整记录。
-            // A partial payload is also allowed only at the tail, preserving all complete records.
             file.set_len(valid_end)?;
             break;
         }
@@ -424,7 +398,6 @@ fn load_wal(file: &mut File) -> StorageResult<(Vec<LogEntry>, Option<u64>)> {
 }
 
 // 尝试读满缓冲区；遇到 EOF 返回已读字节数，用于识别尾部半写。
-// Tries to fill the buffer; EOF returns bytes read so tail partial writes can be detected.
 fn read_some(file: &mut File, buf: &mut [u8]) -> StorageResult<usize> {
     let mut read = 0;
     while read < buf.len() {
@@ -439,7 +412,6 @@ fn read_some(file: &mut File, buf: &mut [u8]) -> StorageResult<usize> {
 }
 
 // 将单条 WAL 记录应用到恢复中的日志，并校验记录不会破坏哨兵边界。
-// Applies one WAL record to the recovering log and validates sentinel-safe boundaries.
 fn apply_record(
     log: &mut Vec<LogEntry>,
     base_index: &mut Option<u64>,
@@ -479,7 +451,6 @@ fn apply_record(
 }
 
 // 尽力同步目录元数据；不支持目录 fsync 的平台上静默退化。
-// Best-effort directory metadata sync; silently degrades on platforms without directory fsync.
 fn sync_dir_best_effort(path: &Path) {
     if let Ok(dir) = File::open(path) {
         let _ = dir.sync_all();
