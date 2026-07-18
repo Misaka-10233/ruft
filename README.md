@@ -1,14 +1,29 @@
-# ruft
+# ruft：基于 Rust 的 Raft 分布式一致性协议实现
 
-`ruft` 是一个基于 Rust 异步生态实现的 Raft 共识库。项目聚焦于 Raft 的核心路径：选主、日志复制、提交与状态机应用、持久化恢复，以及日志压缩和快照安装。
+`ruft` 是一个使用 Rust 实现的 Raft 分布式一致性协议库。项目围绕分布式一致性核心问题展开，包括 Leader 选举、日志复制、提交与状态机应用、持久化恢复、日志压缩和快照安装等。
 
-它不是一个完整的 KV 数据库或生产级分布式系统；它为上层状态机提供可靠的日志复制基础。上层应用提交命令字节，节点在多数副本确认后通过 apply 通道按顺序交付已提交命令。
+项目目标是实现一个可供上层状态机复用的 Raft 节点组件。上层应用可以向 Leader 提交命令，节点在多数派确认后按日志顺序向状态机交付已提交命令，状态机异步接收已提交命令并实际执行。
+
+## 项目背景与目标
+
+在分布式系统中，多个节点之间需要在故障、网络延迟、节点重启等情况下对同一份操作日志达成一致。Raft 将共识问题拆分为 Leader 选举、日志复制、安全性约束和日志压缩等相对清晰的子问题，适合作为学习和实现分布式系统核心机制的项目。
+
+本项目希望实现一个面向上层状态机的 Raft 协议库，主要目标包括：
+
+1. 支持 Follower、Candidate、Leader 三种角色及其状态转换。
+2. 支持随机化选举超时、投票请求、Leader 产生和任期更新。
+3. 支持基于 `AppendEntries` 的心跳、日志复制、冲突检测与日志修复。
+4. 支持多数派提交，并按顺序将已提交日志应用到上层状态机。
+5. 支持内存存储和文件存储两种后端。
+6. 支持硬状态、日志、快照等关键数据的持久化和恢复。
+7. 支持日志压缩和快照安装，为长期运行提供基础能力。
+8. 提供单元测试、真实 TCP 集成测试和简单性能基准。
 
 ## 技术栈
 
 | 领域       | 使用技术               | 用途                                              |
 | ---------- | ---------------------- | ------------------------------------------------- |
-| 编程语言   | Rust 2024 Edition      | 类型安全、所有权和无数据竞争并发模型              |
+| 编程语言   | Rust                   | 类型安全、所有权和无数据竞争并发模型              |
 | 异步运行时 | Tokio                  | 节点事件循环、计时器、通道、并发任务和 TCP I/O    |
 | RPC        | tarpc + tokio-serde    | 基于 TCP 的 Raft RPC 服务与客户端                 |
 | 序列化     | serde + bincode        | RPC 消息、日志条目、硬状态、快照和 WAL 记录编码   |
@@ -27,22 +42,7 @@
 
 ## 架构
 
-```mermaid
-flowchart LR
-    Client[上层状态机或客户端] --> Handle[RuftHandle]
-    Handle --> Events[内部 Event 通道]
-    RpcServer[RuftServer / tarpc] --> Events
-    Timer[随机选举计时器] --> Events
-    Events --> Loop[Ruft::run 单事件循环]
-    Loop --> State[Raft 状态机]
-    State --> Storage[Storage trait]
-    Storage --> Memory[MemoryStorage]
-    Storage --> File[FileStorage: Hard State + WAL + Snapshot]
-    State --> RpcClient[RuftClient]
-    RpcClient --> Peers[其他 Raft 节点]
-    State --> Apply[ApplyMsg 通道]
-    Apply --> Machine[上层状态机]
-```
+![ruft 系统架构示意图](assets/arch.png)
 
 一个节点的关键状态包括：
 
@@ -134,7 +134,9 @@ cargo bench
 
 ## 测试覆盖
 
-测试包括 52 个单元测试和 6 个集成测试，覆盖：
+根据项目测试记录，在开发机上执行 `cargo test` 的结果为：**59 个测试通过，0 个失败**。
+
+测试覆盖：
 
 - 三节点选出唯一 Leader 并复制日志。
 - Follower 拒绝客户端直接写入。
@@ -157,8 +159,7 @@ cargo bench
 | CPU           | 12th Gen Intel Core i5-1240P，12 核 / 16 逻辑处理器 |
 | 内存          | 15.7 GiB                                            |
 | 节点与网络    | 3 个本机 TCP Raft 节点，loopback 网络               |
-| 存储模式      | `MemoryStorage`，不包含文件 `fsync` 成本            |
-| 并发客户端    | 1                                                   |
+| 存储模式      | `MemoryStorage` 或 `FileStorage`                    |
 | Tokio runtime | 4 个 worker 线程                                    |
 
 基准程序支持两个命令行参数：
@@ -185,6 +186,16 @@ cargo bench --bench kvserver -- persistent,clients=8
 表中的“每轮耗时”对应一轮 benchmark 迭代：当 `clients=8` 时，一轮包含 8 个同时发起的 `SET` 请求，而吞吐量已按操作数归一化。因此，并发场景应主要比较吞吐量，不应将每轮耗时直接视为单个请求延迟。
 
 结果表明，在本机 loopback 和内存存储条件下，8 客户端并发将端到端吞吐提升至约 `18.29 K ops/s`；启用文件持久化后，WAL 同步写入成为主要成本，单客户端吞吐约为 `380 ops/s`，8 客户端并发约为 `612 ops/s`。这些数据仅用于展示当前实现的可复现基线，不应视为跨机器网络、其他磁盘、不同操作系统或生产负载下的性能承诺。
+
+## 参考说明
+
+本项目主要基于 Raft 论文、MIT 6.5840 课程对 Raft 的讲解和个人对 Raft 协议的理解进行实现。
+
+- Diego Ongaro, John Ousterhout. *In Search of an Understandable Consensus Algorithm (Extended Version)*.
+- tarpc 官方示例与文档，用于理解 Rust 异步 RPC 服务组织方式：<https://github.com/google/tarpc>。
+- RAFT 个人学习笔记：<https://www.misaka10233.com/2026/05/27/raft-part1/>。
+
+项目基于 Raft 基本机制和个人理解，使用 Rust 独立实现。Raft 协议本身的安全性规则、投票条件、日志匹配原则、Leader 提交约束等机制主要来自 Raft 论文描述。
 
 ## 后续改进方向
 
